@@ -1,0 +1,36 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Go workspace file
+go.work
+
+# Dependency directories
+/vendor/
+/Godeps/
+
+# Build outputs
+/dist/
+gh-history-rewrite-migration
+
+# Migration-specific
+/work/
+*.octoshift.log
+*.octoshift.verbose.log
+.lock
+
+# IDE and misc
+.vscode/
+.idea/
+.env
+.envrc
+/.reference/
