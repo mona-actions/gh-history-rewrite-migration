@@ -11,12 +11,13 @@ import (
 
 // stubExecer records calls and returns canned results.
 type stubExecer struct {
-	lookErr   error
-	runErr    error
-	gotName   string
-	gotArgs   []string
-	gotEnv    []string
-	runCalled bool
+	lookErr    error
+	runErr     error
+	runStderr  string
+	gotName    string
+	gotArgs    []string
+	gotEnv     []string
+	runCalled  bool
 }
 
 func (s *stubExecer) LookPath(name string) (string, error) {
@@ -26,12 +27,12 @@ func (s *stubExecer) LookPath(name string) (string, error) {
 	return "/usr/bin/" + name, nil
 }
 
-func (s *stubExecer) Run(ctx context.Context, name string, args []string, env []string) error {
+func (s *stubExecer) Run(ctx context.Context, name string, args []string, env []string) (string, error) {
 	s.runCalled = true
 	s.gotName = name
 	s.gotArgs = args
 	s.gotEnv = env
-	return s.runErr
+	return s.runStderr, s.runErr
 }
 
 // newWorkDir returns a *workdir.WorkDir with both archives written so the
@@ -106,6 +107,8 @@ func TestRun_HappyPath_GitHubCom(t *testing.T) {
 
 	stub := &stubExecer{}
 	imp := New(wd, Config{
+		SourceOrg:      "src-org",
+		SourceRepo:     "src-repo",
 		TargetOrg:      "dest-org",
 		TargetRepo:     "dest-repo",
 		SourceHostname: "github.com",
@@ -123,6 +126,8 @@ func TestRun_HappyPath_GitHubCom(t *testing.T) {
 	}
 	wantPairs := [][]string{
 		{"gei", "migrate-repo"},
+		{"--github-source-org", "src-org"},
+		{"--source-repo", "src-repo"},
 		{"--github-target-org", "dest-org"},
 		{"--target-repo", "dest-repo"},
 		{"--git-archive-path", wd.GitArchive()},
@@ -146,6 +151,8 @@ func TestRun_GHESSource_AddsAPIURL(t *testing.T) {
 
 	stub := &stubExecer{}
 	imp := New(wd, Config{
+		SourceOrg:      "src-org",
+		SourceRepo:     "src-repo",
 		TargetOrg:      "dest-org",
 		TargetRepo:     "dest-repo",
 		SourceHostname: "ghes.example.com",
@@ -167,7 +174,7 @@ func TestRun_MissingArchives(t *testing.T) {
 		wd := newWorkDir(t, false)
 		// Only write metadata.
 		os.WriteFile(wd.MetadataArchive(), []byte("m"), 0644)
-		imp := New(wd, Config{TargetOrg: "o", TargetRepo: "r", Confirm: true}, &stubExecer{})
+		imp := New(wd, Config{SourceOrg: "src-org", SourceRepo: "src-repo", TargetOrg: "o", TargetRepo: "r", Confirm: true}, &stubExecer{})
 		err := imp.Run(context.Background())
 		if err == nil || !strings.Contains(err.Error(), "git archive not found") {
 			t.Fatalf("expected git archive error, got %v", err)
@@ -177,7 +184,7 @@ func TestRun_MissingArchives(t *testing.T) {
 	t.Run("no metadata archive", func(t *testing.T) {
 		wd := newWorkDir(t, false)
 		os.WriteFile(wd.GitArchive(), []byte("g"), 0644)
-		imp := New(wd, Config{TargetOrg: "o", TargetRepo: "r", Confirm: true}, &stubExecer{})
+		imp := New(wd, Config{SourceOrg: "src-org", SourceRepo: "src-repo", TargetOrg: "o", TargetRepo: "r", Confirm: true}, &stubExecer{})
 		err := imp.Run(context.Background())
 		if err == nil || !strings.Contains(err.Error(), "metadata archive not found") {
 			t.Fatalf("expected metadata archive error, got %v", err)
@@ -190,7 +197,7 @@ func TestRun_MissingPATs(t *testing.T) {
 
 	t.Run("missing GH_SOURCE_PAT", func(t *testing.T) {
 		withPATEnv(t, "", "tgt")
-		imp := New(wd, Config{TargetOrg: "o", TargetRepo: "r", Confirm: true}, &stubExecer{})
+		imp := New(wd, Config{SourceOrg: "src-org", SourceRepo: "src-repo", TargetOrg: "o", TargetRepo: "r", Confirm: true}, &stubExecer{})
 		err := imp.Run(context.Background())
 		if err == nil || !strings.Contains(err.Error(), "GH_SOURCE_PAT") {
 			t.Fatalf("expected GH_SOURCE_PAT error, got %v", err)
@@ -199,7 +206,7 @@ func TestRun_MissingPATs(t *testing.T) {
 
 	t.Run("missing GH_PAT", func(t *testing.T) {
 		withPATEnv(t, "src", "")
-		imp := New(wd, Config{TargetOrg: "o", TargetRepo: "r", Confirm: true}, &stubExecer{})
+		imp := New(wd, Config{SourceOrg: "src-org", SourceRepo: "src-repo", TargetOrg: "o", TargetRepo: "r", Confirm: true}, &stubExecer{})
 		err := imp.Run(context.Background())
 		if err == nil || !strings.Contains(err.Error(), "GH_PAT") {
 			t.Fatalf("expected GH_PAT error, got %v", err)
@@ -212,6 +219,8 @@ func TestRun_NoTTY_RequiresConfirm(t *testing.T) {
 	wd := newWorkDir(t, true)
 	withPATEnv(t, "src", "tgt")
 	imp := New(wd, Config{
+		SourceOrg:  "src-org",
+		SourceRepo: "src-repo",
 		TargetOrg:  "o",
 		TargetRepo: "r",
 		Confirm:    false,
@@ -228,6 +237,8 @@ func TestRun_PATsInEnvNotArgs(t *testing.T) {
 
 	stub := &stubExecer{}
 	imp := New(wd, Config{
+		SourceOrg:      "src-org",
+		SourceRepo:     "src-repo",
 		TargetOrg:      "o",
 		TargetRepo:     "r",
 		SourceHostname: "github.com",
@@ -263,5 +274,25 @@ func TestRun_PATsInEnvNotArgs(t *testing.T) {
 	}
 	if sawTarget != 1 {
 		t.Errorf("expected exactly one GH_PAT entry, got %d", sawTarget)
+	}
+}
+
+func TestRun_StderrErrorDetection(t *testing.T) {
+	wd := newWorkDir(t, true)
+	withPATEnv(t, "src", "tgt")
+
+	// gei exits 0 but prints validation errors to stderr.
+	stub := &stubExecer{runStderr: "Option '--github-source-org' is required.\n"}
+	imp := New(wd, Config{
+		SourceOrg:  "src-org",
+		SourceRepo: "src-repo",
+		TargetOrg:  "o",
+		TargetRepo: "r",
+		Confirm:    true,
+	}, stub)
+
+	err := imp.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "reported errors") {
+		t.Fatalf("expected stderr-detected error, got %v", err)
 	}
 }

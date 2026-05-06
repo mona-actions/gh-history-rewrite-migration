@@ -141,6 +141,8 @@ func runOrchestratorE2E(t *testing.T, mode exporter.Mode, archives e2eArchives, 
 	remapper := remap.NewReal(nil)
 	impExec := &recordingImporterExecer{}
 	imp := importer.New(wd, importer.Config{
+		SourceOrg:      e2eSourceOrg,
+		SourceRepo:     e2eSourceRepo,
 		TargetOrg:      e2eTargetOrg,
 		TargetRepo:     e2eTargetRepo,
 		SourceHostname: e2eSourceHostname,
@@ -258,26 +260,26 @@ func (r *recordingImporterExecer) LookPath(name string) (string, error) {
 	return "/usr/bin/" + name, nil
 }
 
-func (r *recordingImporterExecer) Run(_ context.Context, name string, args []string, env []string) error {
+func (r *recordingImporterExecer) Run(_ context.Context, name string, args []string, env []string) (string, error) {
 	r.runCalled = true
 	r.gotName = name
 	r.gotArgs = append([]string(nil), args...)
 	r.gotEnv = append([]string(nil), env...)
 	gitPath, ok := argValue(args, "--git-archive-path")
 	if !ok {
-		return fmt.Errorf("missing --git-archive-path in %v", args)
+		return "", fmt.Errorf("missing --git-archive-path in %v", args)
 	}
 	metadataPath, ok := argValue(args, "--metadata-archive-path")
 	if !ok {
-		return fmt.Errorf("missing --metadata-archive-path in %v", args)
+		return "", fmt.Errorf("missing --metadata-archive-path in %v", args)
 	}
 	var err error
 	r.gitArchive, err = os.ReadFile(gitPath)
 	if err != nil {
-		return err
+		return "", err
 	}
 	r.metadataArchive, err = os.ReadFile(metadataPath)
-	return err
+	return "", err
 }
 
 type recordingPrinters struct {

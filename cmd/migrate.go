@@ -31,18 +31,17 @@ import (
 var migrateCmd = &cobra.Command{
 	Use:     "migrate",
 	GroupID: "primary",
-	Short:   "Run the full migration end-to-end (export → rewrite → remap → import)",
+	Short:   "Run the full migration end-to-end (export → rewrite/remap → import)",
 	Long: `Migrate a single repository between GitHub organizations, optionally
 rewriting history along the way.
 
 Phases:
   1. (preflight)  doctor checks for git-filter-repo, gh-gei, PATs, ...
-  2. export       download a combined migration archive from the source org
+  2. export       download migration archives from the source org
   3. rewrite      run git filter-repo (strip large files / scripts / flags)
+                  then remap SHAs in metadata JSONs via gh-commit-remap
                   Gate 1: confirms before strip; bypass with --yes
-  4. remap        rewrite SHAs in metadata JSONs (currently stub - pending
-                  upstream gh-commit-remap release; aborts if invoked)
-  5. import       push the rewritten archive into the target org via gh gei
+  4. import       push the rewritten archives into the target org via gh gei
                   Gate 2: confirms before import; bypass with --confirm
 
 Required env vars: GH_SOURCE_PAT (read access to the source repo),
@@ -78,6 +77,17 @@ func init() {
 	migrateCmd.Flags().Bool("strip-large-files", false, "Analyze the repo and strip files exceeding --large-file-threshold")
 	migrateCmd.Flags().StringSlice("filter-repo-script", nil, "Path to a user filter-repo callback script (repeatable)")
 	migrateCmd.Flags().StringSlice("filter-repo-flag", nil, "Raw filter-repo flag/arg to pass through (repeatable)")
+
+	// Phase: import.
+	migrateCmd.Flags().Bool("use-github-storage", false, "Use GitHub's blob storage (required for GHES migrations)")
+	migrateCmd.Flags().String("azure-storage-connection-string", "", "Azure storage connection string for blob upload")
+	migrateCmd.Flags().String("aws-bucket-name", "", "AWS S3 bucket name for archive upload")
+	migrateCmd.Flags().String("aws-region", "", "AWS region for the S3 bucket")
+	migrateCmd.Flags().String("target-api-url", "", "Target API URL (defaults to https://api.github.com)")
+	migrateCmd.Flags().String("target-repo-visibility", "", "Target repo visibility: public, private, or internal")
+	migrateCmd.Flags().Bool("skip-releases", false, "Skip releases when importing")
+	migrateCmd.Flags().Bool("lock-source-repo", false, "Lock source repo during import")
+	migrateCmd.Flags().Bool("no-ssl-verify", false, "Disable SSL verification for GHES communication")
 
 	// Gates.
 	migrateCmd.Flags().Bool("yes", false, "Skip the strip-confirmation prompt (Gate 1)")
@@ -132,6 +142,17 @@ func runMigrate(cmd *cobra.Command, _ []string) error {
 	stripLarge, _ := cmd.Flags().GetBool("strip-large-files")
 	scripts, _ := cmd.Flags().GetStringSlice("filter-repo-script")
 	frFlags, _ := cmd.Flags().GetStringSlice("filter-repo-flag")
+
+	// Import-phase flags.
+	useGHStorage, _ := cmd.Flags().GetBool("use-github-storage")
+	azureConn, _ := cmd.Flags().GetString("azure-storage-connection-string")
+	awsBucket, _ := cmd.Flags().GetString("aws-bucket-name")
+	awsRegion, _ := cmd.Flags().GetString("aws-region")
+	targetAPIURL, _ := cmd.Flags().GetString("target-api-url")
+	repoVisibility, _ := cmd.Flags().GetString("target-repo-visibility")
+	skipReleases, _ := cmd.Flags().GetBool("skip-releases")
+	lockSource, _ := cmd.Flags().GetBool("lock-source-repo")
+	noSSL, _ := cmd.Flags().GetBool("no-ssl-verify")
 
 	// Inert-flag warnings — shared helper so `migrate` and `export`
 	// stay in lockstep on which flags currently no-op upstream.
@@ -206,10 +227,21 @@ func runMigrate(cmd *cobra.Command, _ []string) error {
 
 	// Phase 4: importer.
 	imp := importer.New(wd, importer.Config{
-		TargetOrg:      viper.GetString("TARGET_ORG"),
-		TargetRepo:     targetRepo,
-		SourceHostname: viper.GetString("SOURCE_HOSTNAME"),
-		Confirm:        confirm,
+		SourceOrg:                    viper.GetString("ORG"),
+		SourceRepo:                   viper.GetString("REPO"),
+		TargetOrg:                    viper.GetString("TARGET_ORG"),
+		TargetRepo:                   targetRepo,
+		SourceHostname:               viper.GetString("SOURCE_HOSTNAME"),
+		TargetAPIURL:                 targetAPIURL,
+		TargetRepoVisibility:         repoVisibility,
+		UseGitHubStorage:             useGHStorage,
+		AzureStorageConnectionString: azureConn,
+		AWSBucketName:                awsBucket,
+		AWSRegion:                    awsRegion,
+		SkipReleases:                 skipReleases,
+		LockSourceRepo:               lockSource,
+		NoSSLVerify:                  noSSL,
+		Confirm:                      confirm,
 	}, nil)
 
 	remapIn := remap.Input{

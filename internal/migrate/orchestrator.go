@@ -178,13 +178,13 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 	}
 
 	// Phase 1: export.
-	o.out.Info("Phase 1/4: Exporting source repository archive...")
+	o.out.Info("Phase 1/3: Exporting source repository archive...")
 	if err := o.exporter.Run(ctx); err != nil {
 		return fmt.Errorf("export phase failed: %w", err)
 	}
 
-	// Phase 2: rewrite (Gate 1 lives inside the rewriter).
-	o.out.Info("Phase 2/4: Rewriting history (filter-repo)...")
+	// Phase 2: rewrite + remap (Gate 1 lives inside the rewriter).
+	o.out.Info("Phase 2/3: Rewriting history (filter-repo) and remapping metadata SHAs...")
 	res, err := o.rewriter.Run(ctx)
 	if err != nil {
 		return fmt.Errorf("rewrite phase failed: %w", err)
@@ -198,8 +198,8 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		o.out.Info("Rewrite skipped (already complete in this work-dir).")
 	}
 
-	// Phase 3: remap.
-	o.out.Info("Phase 3/4: Remapping commit SHAs in metadata...")
+	// Remap: idempotent — skips if metadata archive already has sentinel.
+	o.out.Info("Remapping commit SHAs in metadata...")
 	remapRes, err := o.remapper.Run(ctx, o.remapIn)
 	if err != nil {
 		return fmt.Errorf("remap phase failed (raw metadata archive %q, commit map %q): %w",
@@ -209,8 +209,8 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		o.out.Warn(warning)
 	}
 
-	// Phase 4: import (Gate 2 lives inside the importer).
-	o.out.Info("Phase 4/4: Importing into target organization...")
+	// Phase 3: import (Gate 2 lives inside the importer).
+	o.out.Info("Phase 3/3: Importing into target organization...")
 	if err := o.importer.Run(ctx); err != nil {
 		return fmt.Errorf("import phase failed: %w", err)
 	}
