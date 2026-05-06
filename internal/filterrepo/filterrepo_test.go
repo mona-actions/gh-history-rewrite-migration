@@ -323,6 +323,37 @@ func TestRunCallbackScripts_NeverLogsBody(t *testing.T) {
 
 type recordingLogger struct{ msgs []string }
 
-func (r *recordingLogger) Info(m string)  { r.msgs = append(r.msgs, m) }
-func (r *recordingLogger) Warn(m string)  { r.msgs = append(r.msgs, m) }
-func (r *recordingLogger) Error(m string) { r.msgs = append(r.msgs, m) }
+func (r *recordingLogger) Info(m string, args ...any)  { r.msgs = append(r.msgs, m) }
+func (r *recordingLogger) Warn(m string, args ...any)  { r.msgs = append(r.msgs, m) }
+func (r *recordingLogger) Error(m string, args ...any) { r.msgs = append(r.msgs, m) }
+
+func TestCountCommitsRemapped(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "commit-map")
+	content := "old                                      new\n" +
+		"\n" +
+		"# this is a comment\n" +
+		"aaa111 bbb222\n" +
+		"   \n" +
+		"ccc333 ddd444\n" +
+		"# trailing comment\n" +
+		"eee555 fff666\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	got, err := CountCommitsRemapped(path)
+	if err != nil {
+		t.Fatalf("CountCommitsRemapped: %v", err)
+	}
+	if got != 3 {
+		t.Fatalf("expected 3 mappings, got %d", got)
+	}
+}
+
+func TestCountCommitsRemappedMissing(t *testing.T) {
+	_, err := CountCommitsRemapped(filepath.Join(t.TempDir(), "nope"))
+	if err == nil {
+		t.Fatal("expected error for missing commit-map")
+	}
+}

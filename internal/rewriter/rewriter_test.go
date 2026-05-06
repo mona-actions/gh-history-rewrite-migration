@@ -1,10 +1,14 @@
 package rewriter
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -16,12 +20,13 @@ import (
 	"github.com/mona-actions/gh-history-rewrite-migration/internal/workdir"
 )
 
-// stubRunner records calls and the order they happened in.
+// stubRunner records calls and emulates filter-repo writing a commit-map.
 type stubRunner struct {
-	stripCalls    [][2]string // [bareRepo, pathsFromFile]
-	callbackCalls [][]string  // scripts per call
-	runCalls      [][]string  // args per call
+	stripCalls    [][2]string
+	callbackCalls [][]string
+	runCalls      [][]string
 	order         []string
+	writeCount    int
 
 	stripErr    error
 	callbackErr error
@@ -31,17 +36,34 @@ type stubRunner struct {
 func (s *stubRunner) StripPaths(_ context.Context, bare, paths string) error {
 	s.order = append(s.order, "strip")
 	s.stripCalls = append(s.stripCalls, [2]string{bare, paths})
-	return s.stripErr
+	if s.stripErr != nil {
+		return s.stripErr
+	}
+	return s.writeCommitMap(bare)
 }
-func (s *stubRunner) RunCallbackScripts(_ context.Context, _ string, scripts []string) error {
+func (s *stubRunner) RunCallbackScripts(_ context.Context, bare string, scripts []string) error {
 	s.order = append(s.order, "callbacks")
 	s.callbackCalls = append(s.callbackCalls, append([]string(nil), scripts...))
-	return s.callbackErr
+	if s.callbackErr != nil {
+		return s.callbackErr
+	}
+	return s.writeCommitMap(bare)
 }
-func (s *stubRunner) Run(_ context.Context, _ string, args []string) error {
+func (s *stubRunner) Run(_ context.Context, bare string, args []string) error {
 	s.order = append(s.order, "run")
 	s.runCalls = append(s.runCalls, append([]string(nil), args...))
-	return s.runErr
+	if s.runErr != nil {
+		return s.runErr
+	}
+	return s.writeCommitMap(bare)
+}
+func (s *stubRunner) writeCommitMap(bare string) error {
+	s.writeCount++
+	dst := filepath.Join(bare, "filter-repo", "commit-map")
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(dst, []byte("old new\nabc 123\n"), 0o644)
 }
 
 type stubAnalyzer struct {
@@ -55,21 +77,6 @@ func (s *stubAnalyzer) Analyze(_ context.Context, _ string) (*largefiles.Report,
 	return s.report, s.err
 }
 
-// newRewriterTestEnv builds a workdir with an extracted/<name>.git
-// directory so wd.BareRepoPath() resolves. It returns the workdir and the
-// bare repo path.
-func newRewriterTestEnv(t *testing.T) (*workdir.WorkDir, string) {
-	t.Helper()
-	root := t.TempDir()
-	wd, err := workdir.New(root)
-	require.NoError(t, err)
-	bare := filepath.Join(wd.Extracted(), "repo.git")
-	require.NoError(t, os.MkdirAll(bare, 0o755))
-	return wd, bare
-}
-
-// makeRewriter wires a Rewriter with stubbed deps and forces the TTY
-// + confirm functions to deterministic values for tests.
 func makeRewriter(wd *workdir.WorkDir, runner runnerIface, analyzer analyzerIface, cfg Config, isTTY bool, confirmAnswer bool) *Rewriter {
 	r := newWithDeps(wd, runner, analyzer, nil, cfg)
 	r.isTTY = func() bool { return isTTY }
@@ -77,30 +84,61 @@ func makeRewriter(wd *workdir.WorkDir, runner runnerIface, analyzer analyzerIfac
 	return r
 }
 
-func TestRun_Idempotent_Skips(t *testing.T) {
-	wd, bare := newRewriterTestEnv(t)
-	// Pre-populate both commit-map locations to trigger the skip.
-	require.NoError(t, os.WriteFile(wd.CommitMap(), []byte("old new\n"), 0o644))
-	require.NoError(t, os.MkdirAll(filepath.Join(bare, "filter-repo"), 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(bare, "filter-repo", "commit-map"), []byte("old new\n"), 0o644))
-
+func TestRun_ModeUnawareProducesArchiveAndCommitMap(t *testing.T) {
+	wd := newArchiveWorkDir(t, "foo.git")
 	runner := &stubRunner{}
-	analyzer := &stubAnalyzer{}
-	r := makeRewriter(wd, runner, analyzer, Config{StripLargeFiles: true, SkipConfirm: true}, false, false)
+	r := makeRewriter(wd, runner, &stubAnalyzer{}, Config{FilterRepoFlags: []string{"--refs", "main"}}, false, false)
 
 	res, err := r.Run(context.Background())
 	require.NoError(t, err)
-	assert.Nil(t, res)
-	assert.False(t, analyzer.called)
-	assert.Empty(t, runner.order)
+	require.NotNil(t, res)
+	assert.FileExists(t, wd.GitArchive())
+	assert.FileExists(t, wd.CommitMap())
+	assert.Equal(t, 1, len(runner.runCalls))
+	assert.Equal(t, 1, runner.writeCount)
+	assert.Equal(t, 1, res.CommitsRemapped)
+	assert.DirExists(t, filepath.Join(wd.GitExtractedDir(), "repositories", "Acme", "foo.git"))
+}
+
+func TestRun_IdempotentFinalArchiveSkipsExtractAndFilterRepo(t *testing.T) {
+	wd := newArchiveWorkDir(t, "foo.git")
+	runner := &stubRunner{}
+	r := makeRewriter(wd, runner, &stubAnalyzer{}, Config{FilterRepoFlags: []string{"--refs", "main"}}, false, false)
+
+	_, err := r.Run(context.Background())
+	require.NoError(t, err)
+	require.NoError(t, os.RemoveAll(wd.GitExtractedDir()))
+
+	res, err := r.Run(context.Background())
+	require.NoError(t, err)
+	require.NotNil(t, res)
+	assert.Equal(t, 1, len(runner.runCalls))
+	assert.Equal(t, 1, runner.writeCount)
+	assert.NoDirExists(t, wd.GitExtractedDir())
+}
+
+func TestRun_MultipleBareReposRejected(t *testing.T) {
+	wd := newArchiveWorkDir(t, "foo.git", "bar.git")
+	runner := &stubRunner{}
+	r := makeRewriter(wd, runner, &stubAnalyzer{}, Config{FilterRepoFlags: []string{"--refs", "main"}}, false, false)
+
+	_, err := r.Run(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "multi-repo migrations are not supported")
+	assert.Empty(t, runner.runCalls)
+}
+
+func TestRun_NoBareRepoRejected(t *testing.T) {
+	wd := newArchiveWorkDir(t)
+	r := makeRewriter(wd, &stubRunner{}, &stubAnalyzer{}, Config{}, false, false)
+
+	_, err := r.Run(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no .git directory found")
 }
 
 func TestRun_StripHappyPath(t *testing.T) {
-	wd, bare := newRewriterTestEnv(t)
-	// filter-repo would normally produce this — pre-create so handoff succeeds.
-	require.NoError(t, os.MkdirAll(filepath.Join(bare, "filter-repo"), 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(bare, "filter-repo", "commit-map"), []byte("old new\nabc 123\n"), 0o644))
-
+	wd := newArchiveWorkDir(t, "foo.git")
 	analyzer := &stubAnalyzer{report: &largefiles.Report{
 		Threshold: 1024,
 		Flagged: []largefiles.FlaggedPath{
@@ -121,18 +159,16 @@ func TestRun_StripHappyPath(t *testing.T) {
 	require.Len(t, runner.stripCalls, 1)
 	assert.Equal(t, wd.CleanupTxt(), runner.stripCalls[0][1])
 
-	// cleanup.txt should have been written with the two paths.
 	body, err := os.ReadFile(wd.CleanupTxt())
 	require.NoError(t, err)
 	assert.Equal(t, "big1.bin\nbig2.bin\n", string(body))
-
-	// commit-map handoff happened.
+	assert.FileExists(t, wd.GitArchive())
 	assert.FileExists(t, wd.CommitMap())
 	assert.Equal(t, 1, res.CommitsRemapped)
 }
 
-func TestRun_StripZeroFlagged_NoStrip(t *testing.T) {
-	wd, _ := newRewriterTestEnv(t)
+func TestRun_StripZeroFlagged_NoStripStillArchives(t *testing.T) {
+	wd := newArchiveWorkDir(t, "foo.git")
 	analyzer := &stubAnalyzer{report: &largefiles.Report{Threshold: 1024}}
 	runner := &stubRunner{}
 	r := makeRewriter(wd, runner, analyzer, Config{StripLargeFiles: true, SkipConfirm: true}, false, false)
@@ -142,10 +178,11 @@ func TestRun_StripZeroFlagged_NoStrip(t *testing.T) {
 	require.NotNil(t, res)
 	assert.False(t, res.StripPerformed)
 	assert.Empty(t, runner.stripCalls)
+	assert.FileExists(t, wd.GitArchive())
 }
 
 func TestRun_NonTTYWithoutYes_Errors(t *testing.T) {
-	wd, _ := newRewriterTestEnv(t)
+	wd := newArchiveWorkDir(t, "foo.git")
 	analyzer := &stubAnalyzer{report: &largefiles.Report{
 		Threshold: 1024,
 		Flagged:   []largefiles.FlaggedPath{{Path: "big.bin", MaxDeletedUnpackedBytes: 9999, CumulativeBytes: 9999, Reason: largefiles.ReasonBoth}},
@@ -160,13 +197,12 @@ func TestRun_NonTTYWithoutYes_Errors(t *testing.T) {
 }
 
 func TestRun_NonInteractiveWithoutYes_Errors(t *testing.T) {
-	wd, _ := newRewriterTestEnv(t)
+	wd := newArchiveWorkDir(t, "foo.git")
 	analyzer := &stubAnalyzer{report: &largefiles.Report{
 		Threshold: 1024,
 		Flagged:   []largefiles.FlaggedPath{{Path: "big.bin", MaxDeletedUnpackedBytes: 9999, CumulativeBytes: 9999, Reason: largefiles.ReasonBoth}},
 	}}
 	runner := &stubRunner{}
-	// Even with isTTY=true, --non-interactive should hard-error.
 	r := makeRewriter(wd, runner, analyzer, Config{StripLargeFiles: true, NonInteractive: true}, true, false)
 
 	_, err := r.Run(context.Background())
@@ -176,13 +212,9 @@ func TestRun_NonInteractiveWithoutYes_Errors(t *testing.T) {
 }
 
 func TestRun_UserScriptsOnly(t *testing.T) {
-	wd, bare := newRewriterTestEnv(t)
+	wd := newArchiveWorkDir(t, "foo.git")
 	scriptPath := filepath.Join(t.TempDir(), "rewrite.commit-callback.py")
 	require.NoError(t, os.WriteFile(scriptPath, []byte("# noop"), 0o644))
-	// filter-repo would write commit-map; emulate.
-	require.NoError(t, os.MkdirAll(filepath.Join(bare, "filter-repo"), 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(bare, "filter-repo", "commit-map"), []byte("old new\n"), 0o644))
-
 	runner := &stubRunner{}
 	r := makeRewriter(wd, runner, &stubAnalyzer{}, Config{FilterRepoScripts: []string{scriptPath}}, false, false)
 
@@ -196,10 +228,7 @@ func TestRun_UserScriptsOnly(t *testing.T) {
 }
 
 func TestRun_UserFlagsOnly(t *testing.T) {
-	wd, bare := newRewriterTestEnv(t)
-	require.NoError(t, os.MkdirAll(filepath.Join(bare, "filter-repo"), 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(bare, "filter-repo", "commit-map"), []byte("old new\n"), 0o644))
-
+	wd := newArchiveWorkDir(t, "foo.git")
 	runner := &stubRunner{}
 	r := makeRewriter(wd, runner, &stubAnalyzer{}, Config{FilterRepoFlags: []string{"--refs", "main"}}, false, false)
 
@@ -213,12 +242,9 @@ func TestRun_UserFlagsOnly(t *testing.T) {
 }
 
 func TestRun_StripScriptsAndFlags_OrderedAndAllCalled(t *testing.T) {
-	wd, bare := newRewriterTestEnv(t)
+	wd := newArchiveWorkDir(t, "foo.git")
 	scriptPath := filepath.Join(t.TempDir(), "x.commit-callback.py")
 	require.NoError(t, os.WriteFile(scriptPath, []byte("# noop"), 0o644))
-	require.NoError(t, os.MkdirAll(filepath.Join(bare, "filter-repo"), 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(bare, "filter-repo", "commit-map"), []byte("old new\n"), 0o644))
-
 	analyzer := &stubAnalyzer{report: &largefiles.Report{
 		Threshold: 1024,
 		Flagged:   []largefiles.FlaggedPath{{Path: "big.bin", MaxDeletedUnpackedBytes: 9999, CumulativeBytes: 9999, Reason: largefiles.ReasonBoth}},
@@ -241,7 +267,7 @@ func TestRun_StripScriptsAndFlags_OrderedAndAllCalled(t *testing.T) {
 }
 
 func TestRun_StripWithPathSelectionFlag_Rejected(t *testing.T) {
-	wd, _ := newRewriterTestEnv(t)
+	wd := newArchiveWorkDir(t, "foo.git")
 	runner := &stubRunner{}
 	r := makeRewriter(wd, runner, &stubAnalyzer{}, Config{
 		StripLargeFiles: true,
@@ -256,36 +282,35 @@ func TestRun_StripWithPathSelectionFlag_Rejected(t *testing.T) {
 }
 
 func TestRun_DuplicateCallbackKind_Rejected(t *testing.T) {
-	wd, _ := newRewriterTestEnv(t)
+	wd := newArchiveWorkDir(t, "foo.git")
 	dir := t.TempDir()
 	a := filepath.Join(dir, "a.commit-callback.py")
 	b := filepath.Join(dir, "b.commit-callback.py")
 	require.NoError(t, os.WriteFile(a, []byte("x"), 0o644))
 	require.NoError(t, os.WriteFile(b, []byte("y"), 0o644))
-
 	runner := &stubRunner{}
 	r := makeRewriter(wd, runner, &stubAnalyzer{}, Config{FilterRepoScripts: []string{a, b}}, false, false)
+
 	_, err := r.Run(context.Background())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "duplicate")
 }
 
 func TestRun_UnknownCallbackKind_Rejected(t *testing.T) {
-	wd, _ := newRewriterTestEnv(t)
-	dir := t.TempDir()
-	bad := filepath.Join(dir, "weird.py")
+	wd := newArchiveWorkDir(t, "foo.git")
+	bad := filepath.Join(t.TempDir(), "weird.py")
 	require.NoError(t, os.WriteFile(bad, []byte("x"), 0o644))
-
 	runner := &stubRunner{}
 	r := makeRewriter(wd, runner, &stubAnalyzer{}, Config{FilterRepoScripts: []string{bad}}, false, false)
+
 	_, err := r.Run(context.Background())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unknown callback kind")
 }
 
-func TestHandoffCommitMap_CopiesContent(t *testing.T) {
-	wd, bare := newRewriterTestEnv(t)
-	src := filepath.Join(bare, "filter-repo", "commit-map")
+func TestHandoffCommitMap_CopiesContentAtomically(t *testing.T) {
+	wd := newArchiveWorkDir(t, "foo.git")
+	src := filepath.Join(wd.GitExtractedDir(), "repositories", "Acme", "foo.git", "filter-repo", "commit-map")
 	require.NoError(t, os.MkdirAll(filepath.Dir(src), 0o755))
 	want := "old new\nabc 123\ndef 456\n"
 	require.NoError(t, os.WriteFile(src, []byte(want), 0o644))
@@ -299,30 +324,18 @@ func TestHandoffCommitMap_CopiesContent(t *testing.T) {
 }
 
 func TestHandoffCommitMap_MissingSource_Warns(t *testing.T) {
-	wd, bare := newRewriterTestEnv(t)
+	wd := newArchiveWorkDir(t, "foo.git")
 	r := newWithDeps(wd, &stubRunner{}, &stubAnalyzer{}, nil, Config{})
-	warn := r.handoffCommitMap(filepath.Join(bare, "filter-repo", "commit-map"))
+	warn := r.handoffCommitMap(filepath.Join(wd.GitExtractedDir(), "repositories", "Acme", "foo.git", "filter-repo", "commit-map"))
 	assert.Contains(t, warn, "no commit-map produced")
 	_, err := os.Stat(wd.CommitMap())
 	assert.True(t, os.IsNotExist(err))
 }
 
 func TestSanitizeUserFlags_RedactsCallbackBodies(t *testing.T) {
-	in := []string{
-		"--commit-callback=secret-body",
-		"--refs",
-		"main",
-		"--message-callback=other-body",
-		"--no-value-flag",
-	}
+	in := []string{"--commit-callback=secret-body", "--refs", "main", "--message-callback=other-body", "--no-value-flag"}
 	got := sanitizeUserFlags(in)
-	assert.Equal(t, []string{
-		"--commit-callback=<redacted>",
-		"--refs",
-		"main",
-		"--message-callback=<redacted>",
-		"--no-value-flag",
-	}, got)
+	assert.Equal(t, []string{"--commit-callback=<redacted>", "--refs", "main", "--message-callback=<redacted>", "--no-value-flag"}, got)
 }
 
 func TestResultRender_PrintsKeyFields(t *testing.T) {
@@ -354,8 +367,8 @@ func TestResultRender_PrintsKeyFields(t *testing.T) {
 	out := buf.String()
 	assert.Contains(t, out, "big1.bin")
 	assert.Contains(t, out, "big2.bin")
-	assert.Contains(t, out, "4.8 MiB") // 5_000_000 bytes
-	assert.Contains(t, out, "6.7 MiB") // 7_000_000 bytes
+	assert.Contains(t, out, "4.8 MiB")
+	assert.Contains(t, out, "6.7 MiB")
 	assert.Contains(t, out, "42")
 	assert.Contains(t, out, "a.commit-callback.py")
 	assert.Contains(t, out, "--refs")
@@ -363,15 +376,93 @@ func TestResultRender_PrintsKeyFields(t *testing.T) {
 }
 
 func TestHumanBytes(t *testing.T) {
-	cases := map[int64]string{
-		0:           "0 B",
-		512:         "512 B",
-		1024:        "1.0 KiB",
-		1536:        "1.5 KiB",
-		1 << 20:     "1.0 MiB",
-		1<<30 + 100: "1.0 GiB",
-	}
+	cases := map[int64]string{0: "0 B", 512: "512 B", 1024: "1.0 KiB", 1536: "1.5 KiB", 1 << 20: "1.0 MiB", 1<<30 + 100: "1.0 GiB"}
 	for n, want := range cases {
 		assert.Equal(t, want, HumanBytes(n), "n=%d", n)
 	}
+}
+
+func newArchiveWorkDir(t *testing.T, repoNames ...string) *workdir.WorkDir {
+	t.Helper()
+	wd, err := workdir.New(t.TempDir())
+	require.NoError(t, err)
+	srcRoot := t.TempDir()
+	for _, name := range repoNames {
+		createBareRepoWithCommit(t, filepath.Join(srcRoot, "repositories", "Acme", name))
+	}
+	writeTarGz(t, srcRoot, wd.RawGitArchive())
+	return wd
+}
+
+func createBareRepoWithCommit(t *testing.T, bare string) {
+	t.Helper()
+	require.NoError(t, os.MkdirAll(filepath.Dir(bare), 0o755))
+	runGit(t, "", "init", "--bare", bare)
+	work := filepath.Join(t.TempDir(), "work")
+	runGit(t, "", "init", work)
+	runGit(t, work, "config", "user.email", "t@example.test")
+	runGit(t, work, "config", "user.name", "tester")
+	runGit(t, work, "config", "commit.gpgsign", "false")
+	require.NoError(t, os.WriteFile(filepath.Join(work, "README.md"), []byte("hello\n"), 0o644))
+	runGit(t, work, "add", "README.md")
+	runGit(t, work, "commit", "-m", "seed")
+	runGit(t, work, "push", bare, "HEAD:refs/heads/main")
+}
+
+func runGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, "git %s failed:\n%s", strings.Join(args, " "), string(out))
+}
+
+func writeTarGz(t *testing.T, srcRoot, outPath string) {
+	t.Helper()
+	out, err := os.Create(outPath)
+	require.NoError(t, err)
+	defer out.Close()
+	gz := gzip.NewWriter(out)
+	defer gz.Close()
+	tw := tar.NewWriter(gz)
+	defer tw.Close()
+
+	err = filepath.WalkDir(srcRoot, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if path == srcRoot {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		hdr, err := tar.FileInfoHeader(info, "")
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(srcRoot, path)
+		if err != nil {
+			return err
+		}
+		hdr.Name = filepath.ToSlash(rel)
+		if d.IsDir() {
+			hdr.Name += "/"
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		_, err = io.Copy(tw, f)
+		return err
+	})
+	require.NoError(t, err)
 }

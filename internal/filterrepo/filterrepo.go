@@ -30,6 +30,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/mona-actions/gh-history-rewrite-migration/internal/output"
 )
 
 // DefaultExecer is the production Execer that shells out via os/exec and
@@ -63,19 +65,10 @@ type Execer interface {
 	Run(ctx context.Context, dir, name string, args []string, stdout, stderr io.Writer) error
 }
 
-// Logger is the minimal logging surface this package needs. A nil logger is
-// safe: helpers below short-circuit on nil so callers without an output
-// pipeline (tests, library consumers) do not need to construct one.
-type Logger interface {
-	Info(msg string)
-	Warn(msg string)
-	Error(msg string)
-}
-
 // Runner exposes high-level operations on top of the git filter-repo binary.
 type Runner struct {
 	execer Execer
-	log    Logger
+	log    output.Logger
 	stdout io.Writer
 	bin    string // resolved path to git (filter-repo runs as a git subcommand)
 }
@@ -83,7 +76,7 @@ type Runner struct {
 // New constructs a Runner. The execer must be non-nil; the logger may be nil.
 // Filter-repo's stdout is forwarded to os.Stdout by default; use
 // WithStdout to redirect it.
-func New(execer Execer, log Logger) *Runner {
+func New(execer Execer, log output.Logger) *Runner {
 	return &Runner{execer: execer, log: log, stdout: os.Stdout, bin: "git"}
 }
 
@@ -470,4 +463,32 @@ func (r *Runner) StripPaths(ctx context.Context, bareRepoPath, pathsFromFile str
 		return fmt.Errorf("git filter-repo --invert-paths failed: %w (stderr=%q)", err, stderr.String())
 	}
 	return nil
+}
+
+// CountCommitsRemapped returns the number of old->new SHA mappings in a
+// filter-repo commit-map file.
+func CountCommitsRemapped(commitMapPath string) (int, error) {
+	f, err := os.Open(commitMapPath)
+	if err != nil {
+		return 0, fmt.Errorf("filterrepo: open commit-map: %w", err)
+	}
+	defer f.Close()
+
+	count := 0
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if fields := strings.Fields(line); len(fields) == 2 && fields[0] == "old" && fields[1] == "new" {
+			continue
+		}
+		count++
+	}
+	if err := scanner.Err(); err != nil {
+		return 0, fmt.Errorf("filterrepo: read commit-map: %w", err)
+	}
+	return count, nil
 }

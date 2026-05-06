@@ -2,14 +2,9 @@
 
 > An end-to-end orchestrator for GitHub repo migrations that need git history rewritten before import — large-file removal, callback-based rewrites, or both.
 
-> **Status: v1 — single-repo migrations.** Multi-repo support and full remap automation are pending the upstream `mona-actions/gh-commit-remap` `pkg/` release. The orchestrator currently aborts cleanly at the remap step with `ErrUpstreamPending`; see [Limitations](#limitations) and [`docs/manual-remap.md`](docs/manual-remap.md) for the supported workaround.
+> **Status: v2 — single-repo migrations.** The default export path uses two GitHub migration API calls so the local archives match the format `gh gei migrate-repo` expects. SHA remapping is automatic: `gh-commit-remap` rewrites commit references in metadata JSONs before import.
 
-`gh-history-rewrite-migration` wraps the `export → rewrite → remap → import`
-pipeline behind a single `migrate` command, with two interactive
-confirmation gates protecting the destructive operations. Under the hood
-it talks to the GitHub Migrations REST API, drives `git filter-repo`,
-hands off to `gh-commit-remap`, and pushes the rewritten archive into the
-target organization via `gh gei migrate-repo`.
+`gh-history-rewrite-migration` wraps the `export → rewrite → remap → import` pipeline behind a single `migrate` command, with two interactive confirmation gates protecting the destructive operations. Under the hood it talks to the GitHub Migrations REST API, drives `git filter-repo`, remaps metadata with `gh-commit-remap`, and imports the rewritten local archives into the target organization via `gh gei migrate-repo`.
 
 ---
 
@@ -44,16 +39,13 @@ Run the preflight checker before your first migration:
 gh history-rewrite-migration doctor
 ```
 
-`doctor` verifies all of the above, plus work-dir writability and free
-disk space (extraction + rewrite + retar typically needs **3–4× the
-archive size**).
+`doctor` verifies all of the above, plus work-dir writability and free disk space (extraction + rewrite + retar typically needs **3–4× the archive size**).
 
 ---
 
 ## Quick start
 
-Migrate `acme/legacy-monorepo` from `github.com` into `acme-cloud` on
-GHEC, stripping any file paths whose blobs exceed 400 MB along the way:
+Migrate `acme/legacy-monorepo` from `github.com` into `acme-cloud` on GHEC, stripping any file paths whose blobs exceed 400 MB along the way:
 
 ```bash
 export GH_SOURCE_PAT=ghp_xxx_source
@@ -69,15 +61,10 @@ gh history-rewrite-migration migrate \
 
 You will be prompted twice:
 
-1. **Gate 1 — pre-strip.** A table of candidate paths (with `MAX BLOB` and
-   `CUMULATIVE` columns) is printed; confirm to rewrite history. Bypass
-   non-interactively with `--yes`.
-2. **Gate 2 — pre-import.** A post-rewrite summary is printed; confirm
-   to push the rewritten archive into the target org. Bypass
-   non-interactively with `--confirm`.
+1. **Gate 1 — pre-strip.** A table of candidate paths (with `MAX BLOB` and `CUMULATIVE` columns) is printed; confirm to rewrite history. Bypass non-interactively with `--yes`.
+2. **Gate 2 — pre-import.** A post-rewrite summary is printed; confirm to push the rewritten archive into the target org. Bypass non-interactively with `--confirm`.
 
-For CI / scripted use, pair `--non-interactive` with `--yes` and
-`--confirm` so the run fails fast instead of blocking on stdin:
+For CI / scripted use, pair `--non-interactive` with `--yes` and `--confirm` so the run fails fast instead of blocking on stdin:
 
 ```bash
 gh history-rewrite-migration migrate \
@@ -88,6 +75,61 @@ gh history-rewrite-migration migrate \
 
 ---
 
+## Pipeline
+
+```text
+┌────────────┐     ┌────────────────┐     ┌───────────────────┐     ┌──────────────┐
+│  Export    │ ──► │ Rewrite        │ ──► │ Remap             │ ──► │ Import       │
+│ migrations │     │ git filter-repo│     │ gh-commit-remap   │     │ gh gei       │
+└─────┬──────┘     └───────┬────────┘     └─────────┬─────────┘     └──────┬───────┘
+      │                    │                        │                      │
+      ▼                    ▼                        ▼                      ▼
+raw git + metadata   rewritten git archive   metadata JSON SHAs      target repo on
+archives in work-dir + commit-map            rewritten from map       GHEC
+```
+
+The end-to-end flow is:
+
+1. **Export** from the source org with the GitHub Migrations REST API.
+2. **Rewrite** the extracted bare repository with `git filter-repo` and copy its `commit-map` into the work directory.
+3. **Remap** metadata JSON files with `gh-commit-remap`, replacing old commit SHAs with rewritten SHAs from the `commit-map`.
+4. **Import** the final `git_archive.tar.gz` and `metadata_archive.tar.gz` with `gh gei migrate-repo --git-archive-path ... --metadata-archive-path ...`.
+
+---
+
+## Export modes
+
+`--export-mode` controls how the source archives are produced:
+
+| Mode | Behavior | Tradeoff |
+| --- | --- | --- |
+| `two` (default) | Runs two separate migration API calls: git-only and metadata-only. | Format-safe by construction because the local archives match the split archives `gh gei` itself produces. |
+| `combined` | Runs one migration API call and splits the combined archive locally. | Reduces source-side migration load, but relies on the local splitter to recreate the split archive shape. |
+
+Both modes normalize into the same downstream work-dir layout. The selected mode is persisted in `<work-dir>/.export-mode`; resuming with a different `--export-mode` is rejected so a partially completed work directory cannot be silently mixed across archive formats.
+
+---
+
+## Work directory layout
+
+A completed v2 work directory contains:
+
+```text
+<work-dir>/
+├── git_archive_raw.tar.gz       # raw git-only export
+├── metadata_archive_raw.tar.gz  # raw metadata-only export
+├── git_extracted/               # extracted git archive; contains repositories/<org>/<repo>.git/
+├── metadata_extracted/          # extracted metadata archive; contains metadata JSONs
+├── git_archive.tar.gz           # final rewritten git archive for gh gei import
+├── metadata_archive.tar.gz      # final remapped metadata archive for gh gei import
+├── commit-map                   # git filter-repo old-sha -> new-sha map
+└── .export-mode                 # export mode used to create this work-dir
+```
+
+`git_extracted/` and `metadata_extracted/` may also contain sentinel files used for resumability. Treat the entire work directory as sensitive migration data.
+
+---
+
 ## The two confirmation gates
 
 | Gate | When | Skipped by | Forced-error in CI by |
@@ -95,10 +137,7 @@ gh history-rewrite-migration migrate \
 | **Gate 1** — strip preview | After `git filter-repo --analyze`, before any history rewrite | `--yes` | `--non-interactive` (without `--yes`) |
 | **Gate 2** — pre-import | After `rewrite` + `remap`, before `gh gei migrate-repo` | `--confirm` | `--non-interactive` (without `--confirm`) |
 
-`--non-interactive` is a CI convenience: it converts any prompt that
-would otherwise block on stdin into an immediate error, so a misconfigured
-pipeline does not hang. Standalone `import` always requires `--confirm`
-when run without a TTY.
+`--non-interactive` is a CI convenience: it converts any prompt that would otherwise block on stdin into an immediate error, so a misconfigured pipeline does not hang. Standalone `import` always requires `--confirm` when run without a TTY.
 
 ---
 
@@ -107,124 +146,42 @@ when run without a TTY.
 | Command | Role |
 | --- | --- |
 | `migrate` | **Primary.** Runs `export → rewrite → remap → import` end-to-end with both confirmation gates. |
-| `export` | Advanced. Downloads a combined migration archive from the source org via the REST migrations API and extracts it in place. |
+| `export` | Advanced. Downloads raw git and metadata archives from the source org. Honors `--export-mode two` and `--export-mode combined`. |
 | `rewrite` | Advanced. Runs `git filter-repo` against the extracted bare repo (`--strip-large-files`, `--filter-repo-script`, `--filter-repo-flag`). |
 | `import` | Advanced. Pushes a previously rewritten git+metadata archive pair into the target GHEC org via `gh gei migrate-repo`. |
 | `doctor` | Preflight checks (binaries, versions, env vars, source reachability, disk space). |
 
-Run `gh history-rewrite-migration <command> --help` for the full flag
-surface.
-
----
-
-## Architecture
-
-```text
-   ┌──────────────────┐                       source org / GHEC or GHES
-   │ GH_SOURCE_PAT    │                       │
-   └─────────┬────────┘                       ▼
-             │                ┌──────────────────────────────┐
-             │   1. export    │ POST /orgs/{org}/migrations  │
-             ▼   ──────────►  │ poll → 302 archive download  │
-   ┌──────────────────┐       └────────────────┬─────────────┘
-   │  <work-dir>/     │                        │
-   │  archive.tar.gz  │ ◄──────────────────────┘
-   └─────────┬────────┘
-             │  2. extract
-             ▼
-   ┌──────────────────┐
-   │ extracted/       │   <RepoName>.git/  + metadata JSONs (+ git-lfs/)
-   └─────────┬────────┘
-             │  3. rewrite      git filter-repo --analyze
-             │                  + cleanup.txt (strip)
-             │                  + user *.commit-callback.py / *.email-callback.py / …
-             │                  + raw --filter-repo-flag passthrough
-             ▼                  → <bare>/filter-repo/commit-map
-   ┌──────────────────┐
-   │ commit-map       │ copied to <work-dir>/commit-map
-   └─────────┬────────┘
-             │  4. remap         gh-commit-remap rewrites SHAs
-             │                   inside the metadata JSONs and
-             │                   re-tars two archives
-             ▼
-   ┌──────────────────────┐    ┌───────────────────────────┐
-   │ git_archive.tar.gz   │    │ metadata_archive.tar.gz   │
-   └──────────┬───────────┘    └─────────────┬─────────────┘
-              │  5. import (Gate 2)          │
-              └───────┬──────────────────────┘
-                      ▼
-        gh gei migrate-repo \
-            --github-target-org <target>  --target-repo <repo> \
-            --git-archive-path … --metadata-archive-path …
-                      │
-                      ▼
-                target org on GHEC (github.com)
-```
-
-Notes:
-
-- The migrations API delivers a **single** combined tarball; the split
-  into `git_archive.tar.gz` + `metadata_archive.tar.gz` happens during
-  remap so the importer can use `gh gei`'s hidden local-archive flags.
-- `filter-repo` only ever touches `<RepoName>.git/`. Metadata JSONs are
-  rewritten by `gh-commit-remap` using the `commit-map` filter-repo emits.
-- The bare repo is discovered (the unique `*.git` directory under
-  `extracted/`); the GitHub-emitted prefix-dir scheme is not assumed.
+Run `gh history-rewrite-migration <command> --help` for the full flag surface.
 
 ---
 
 ## Limitations
 
-- **Single-repo only in v1.** Multi-repo archives are rejected. Run the
-  orchestrator once per repo; multi-repo orchestration is on the roadmap.
-- **Target is always GHEC (`github.com`).** `gh gei migrate-repo` does
-  not support GHES targets, so this orchestrator does not expose a
-  `--target-hostname` flag. Sources may be GHEC or GHES (set
-  `--source-hostname` for GHES).
-- **`gh-commit-remap` real implementation pending upstream `pkg/`
-  release.** The orchestrator currently aborts cleanly at the remap step
-  with `ErrUpstreamPending`. A documented stop-gap exists for users who
-  need to ship today — see [`docs/manual-remap.md`](docs/manual-remap.md).
-- **`filter-repo` strips GPG signatures silently.** This is upstream
-  behavior; signed-commit compliance teams should be aware. The
-  post-rewrite summary surfaces whether signed commits were detected.
-- **LFS pointer mappings are not rewritten.** LFS objects live under
-  `git-lfs/` outside the bare repo, so `filter-repo` cannot touch them.
-  When `--strip-large-files` would touch an LFS-enabled archive,
-  `--allow-lfs-rewrite` is required and the orchestrator surfaces a
-  prominent warning.
-- **Pushed forks downstream of rewritten history will diverge.** History
-  rewriting changes every commit SHA from the strip point forward;
-  consumers of the source repo must re-clone.
+- **Single-repo only.** Multi-repo migration archives are rejected. Run the orchestrator once per repository.
+- **Target is always GHEC (`github.com`).** `gh gei migrate-repo` does not support GHES targets, so this orchestrator does not expose a `--target-hostname` flag. Sources may be GHEC or GHES (set `--source-hostname` for GHES).
+- **Upstream `gh-commit-remap` prefix list is incomplete.** Upstream's known SHA-bearing metadata prefixes do not currently include every file where commit SHAs may appear. This project extends the list in `internal/remap` via `SHABearingPrefixes`.
+- **Upstream `gh-commit-remap` scans top-level metadata files only.** This project works around that by recursively discovering metadata roots with `FindMetadataDirs` before invoking the remapper.
+- **`filter-repo` strips GPG signatures silently.** This is upstream behavior; signed-commit compliance teams should be aware. The post-rewrite summary surfaces whether signed commits were detected.
+- **LFS pointer mappings are not rewritten.** LFS objects live outside the bare repo, so `filter-repo` cannot touch them. When `--strip-large-files` would touch an LFS-enabled archive, `--allow-lfs-rewrite` is required and the orchestrator surfaces a prominent warning.
+- **Pushed forks downstream of rewritten history will diverge.** History rewriting changes every commit SHA from the strip point forward; consumers of the source repo must re-clone.
 
 ---
 
 ## Documentation
 
-- [`docs/large-files.md`](docs/large-files.md) — `--strip-large-files`
-  walkthrough, threshold tuning, the Gate 1 preview, recovery.
-- [`docs/callback-scripts.md`](docs/callback-scripts.md) — the eight
-  callback-script suffixes, validation rules, raw-flag passthrough.
-- [`docs/manual-remap.md`](docs/manual-remap.md) — temporary stop-gap
-  for the upstream `gh-commit-remap` blocker.
+- [`docs/large-files.md`](docs/large-files.md) — `--strip-large-files` walkthrough, threshold tuning, the Gate 1 preview, recovery.
+- [`docs/callback-scripts.md`](docs/callback-scripts.md) — the eight callback-script suffixes, validation rules, raw-flag passthrough.
+- [`docs/manual-verification.md`](docs/manual-verification.md) — gei-import smoke test for validating archive compatibility beyond unit tests.
 - [`examples/scripts/`](examples/scripts/) — runnable callback examples.
 
 ---
 
 ## Security
 
-- **PATs are passed via environment variables** (`GH_SOURCE_PAT`,
-  `GH_PAT`) and never via argv. Process listings (`ps`, `/proc`) will
-  not leak credentials.
-- **Callback script bodies are never logged** — only the script path
-  and the upstream `filter-repo` stderr are surfaced on errors.
-- **Do not commit your callback scripts to a public repo if they
-  contain sensitive logic** (internal hostnames, employee email
-  patterns, redaction rules). Treat them like any other piece of
-  migration tooling.
-- The work directory contains the extracted source repository and
-  intermediate archives; clean it up (or store it in an encrypted
-  volume) when done.
+- **PATs are passed via environment variables** (`GH_SOURCE_PAT`, `GH_PAT`) and never via argv. Process listings (`ps`, `/proc`) will not leak credentials.
+- **Callback script bodies are never logged** — only the script path and the upstream `filter-repo` stderr are surfaced on errors.
+- **Do not commit your callback scripts to a public repo if they contain sensitive logic** (internal hostnames, employee email patterns, redaction rules). Treat them like any other piece of migration tooling.
+- The work directory contains the extracted source repository and intermediate archives; clean it up (or store it in an encrypted volume) when done.
 
 ---
 

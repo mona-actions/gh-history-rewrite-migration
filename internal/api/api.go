@@ -21,11 +21,57 @@ type API struct {
 	hostname string
 }
 
-// MigrationOpts contains options for starting an organization migration.
+// MigrationOpts is the JSON wire shape for starting an organization migration.
+// Prefer GitOnlyMigrationOpts, MetadataOnlyMigrationOpts, or CombinedMigrationOpts
+// over direct construction so mutually exclusive archive-shaping flags remain valid.
 type MigrationOpts struct {
-	Repositories       []string
-	LockRepositories   bool
+	Repositories         []string `json:"repositories,omitempty"`
+	ExcludeMetadata      bool     `json:"exclude_metadata,omitempty"`
+	ExcludeGitData       bool     `json:"exclude_git_data,omitempty"`
+	ExcludeOwnerProjects bool     `json:"exclude_owner_projects,omitempty"`
+	ExcludeReleases      bool     `json:"exclude_releases,omitempty"`
+	LockRepositories     bool     `json:"lock_repositories,omitempty"`
+	ExcludeAttachments   bool     `json:"exclude_attachments,omitempty"`
+}
+
+// BaseToggles contains migration toggles shared by metadata-only and combined exports.
+type BaseToggles struct {
+	ExcludeReleases    bool
 	ExcludeAttachments bool
+	LockRepositories   bool
+}
+
+// GitOnlyMigrationOpts builds opts for the git-only archive migration.
+// It excludes metadata; git data is always included.
+func GitOnlyMigrationOpts(repo string) MigrationOpts {
+	return MigrationOpts{
+		Repositories:    []string{repo},
+		ExcludeMetadata: true,
+	}
+}
+
+// MetadataOnlyMigrationOpts builds opts for the metadata-only migration.
+// It excludes git data and owner projects, and applies caller-provided toggles.
+func MetadataOnlyMigrationOpts(repo string, base BaseToggles) MigrationOpts {
+	return MigrationOpts{
+		Repositories:         []string{repo},
+		ExcludeGitData:       true,
+		ExcludeOwnerProjects: true,
+		ExcludeReleases:      base.ExcludeReleases,
+		LockRepositories:     base.LockRepositories,
+		ExcludeAttachments:   base.ExcludeAttachments,
+	}
+}
+
+// CombinedMigrationOpts builds opts for the legacy single-archive migration.
+// It applies caller-provided toggles without archive-shaping exclude flags.
+func CombinedMigrationOpts(repo string, base BaseToggles) MigrationOpts {
+	return MigrationOpts{
+		Repositories:       []string{repo},
+		ExcludeReleases:    base.ExcludeReleases,
+		LockRepositories:   base.LockRepositories,
+		ExcludeAttachments: base.ExcludeAttachments,
+	}
 }
 
 // Migration represents a GitHub organization migration.
@@ -106,12 +152,15 @@ func (a *API) Reachable(ctx context.Context) error {
 // StartOrgMigration starts an organization migration with the specified options.
 // Returns the migration ID on success.
 func (a *API) StartOrgMigration(ctx context.Context, org string, opts MigrationOpts) (int64, error) {
-	migrationOpts := &github.MigrationOptions{
-		LockRepositories:   opts.LockRepositories,
-		ExcludeAttachments: opts.ExcludeAttachments,
+	u := fmt.Sprintf("orgs/%v/migrations", org)
+	req, err := a.client.NewRequest("POST", u, opts)
+	if err != nil {
+		return 0, fmt.Errorf("failed to create migration request: %w", err)
 	}
+	req.Header.Set("Accept", "application/vnd.github.wyandotte-preview+json")
 
-	result, _, err := a.client.Migrations.StartMigration(ctx, org, opts.Repositories, migrationOpts)
+	var result github.Migration
+	_, err = a.client.Do(ctx, req, &result)
 	if err != nil {
 		return 0, fmt.Errorf("failed to start migration: %w", err)
 	}

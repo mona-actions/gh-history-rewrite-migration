@@ -9,6 +9,21 @@ import (
 	"golang.org/x/term"
 )
 
+// Logger is the minimal structured logging surface shared by packages that
+// accept an injected logger.
+type Logger interface {
+	Info(message string, args ...any)
+	Warn(message string, args ...any)
+	Error(message string, args ...any)
+}
+
+// PackageLogger adapts this package's package-level output functions to Logger.
+type PackageLogger struct{}
+
+func (PackageLogger) Info(message string, args ...any)  { Info(formatMessage(message, args...)) }
+func (PackageLogger) Warn(message string, args ...any)  { Warn(formatMessage(message, args...)) }
+func (PackageLogger) Error(message string, args ...any) { Error(formatMessage(message, args...)) }
+
 // Info prints an informational message using pterm's info printer.
 func Info(message string) {
 	if viper.GetBool("NO_COLOR") {
@@ -117,4 +132,11 @@ func HumanBytes(n int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
+func formatMessage(message string, args ...any) string {
+	if len(args) == 0 {
+		return message
+	}
+	return fmt.Sprintf(message, args...)
 }

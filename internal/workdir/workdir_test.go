@@ -37,87 +37,33 @@ func TestNew_CreatesDirectory(t *testing.T) {
 	assert.True(t, info.IsDir())
 }
 
-func TestPathHelpers(t *testing.T) {
+func TestWorkDirPaths(t *testing.T) {
 	tmpDir := t.TempDir()
 	wd, err := New(tmpDir)
 	require.NoError(t, err)
 
-	// All paths should be absolute and under the root
-	assert.True(t, filepath.IsAbs(wd.Archive()))
-	assert.True(t, filepath.IsAbs(wd.Extracted()))
-	assert.True(t, filepath.IsAbs(wd.CommitMap()))
-	assert.True(t, filepath.IsAbs(wd.GitArchive()))
-	assert.True(t, filepath.IsAbs(wd.MetadataArchive()))
-	assert.True(t, filepath.IsAbs(wd.CleanupTxt()))
+	paths := map[string]string{
+		"git_archive_raw.tar.gz":      wd.RawGitArchive(),
+		"metadata_archive_raw.tar.gz": wd.RawMetadataArchive(),
+		"git_extracted":               wd.GitExtractedDir(),
+		"metadata_extracted":          wd.MetadataExtractedDir(),
+		"git_archive.tar.gz":          wd.GitArchive(),
+		"metadata_archive.tar.gz":     wd.MetadataArchive(),
+		"commit-map":                  wd.CommitMap(),
+		".export-mode":                wd.ExportModeFile(),
+		"_combined_raw.tar.gz":        wd.CombinedRawArchive(),
+		"_combined_split":             wd.CombinedSplitDir(),
+		"_git_stage":                  wd.GitStageDir(),
+		"_meta_stage":                 wd.MetaStageDir(),
+		"cleanup.txt":                 wd.CleanupTxt(),
+	}
 
-	// Check expected filenames
-	assert.Equal(t, "archive.tar.gz", filepath.Base(wd.Archive()))
-	assert.Equal(t, "extracted", filepath.Base(wd.Extracted()))
-	assert.Equal(t, "commit-map", filepath.Base(wd.CommitMap()))
-	assert.Equal(t, "git_archive.tar.gz", filepath.Base(wd.GitArchive()))
-	assert.Equal(t, "metadata_archive.tar.gz", filepath.Base(wd.MetadataArchive()))
-	assert.Equal(t, "cleanup.txt", filepath.Base(wd.CleanupTxt()))
-}
-
-func TestBareRepoPath_NoGitDir(t *testing.T) {
-	tmpDir := t.TempDir()
-	wd, err := New(tmpDir)
-	require.NoError(t, err)
-
-	// Create extracted directory without .git
-	extractedDir := wd.Extracted()
-	err = os.MkdirAll(extractedDir, 0755)
-	require.NoError(t, err)
-
-	_, err = wd.BareRepoPath()
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "no .git directory found")
-}
-
-func TestBareRepoPath_OneGitDir(t *testing.T) {
-	tmpDir := t.TempDir()
-	wd, err := New(tmpDir)
-	require.NoError(t, err)
-
-	// Create extracted directory with one .git
-	extractedDir := wd.Extracted()
-	gitDir := filepath.Join(extractedDir, "repo.git")
-	err = os.MkdirAll(gitDir, 0755)
-	require.NoError(t, err)
-
-	path, err := wd.BareRepoPath()
-	require.NoError(t, err)
-	assert.Equal(t, gitDir, path)
-}
-
-func TestBareRepoPath_MultipleGitDirs(t *testing.T) {
-	tmpDir := t.TempDir()
-	wd, err := New(tmpDir)
-	require.NoError(t, err)
-
-	// Create extracted directory with multiple .git directories
-	extractedDir := wd.Extracted()
-	gitDir1 := filepath.Join(extractedDir, "repo1.git")
-	gitDir2 := filepath.Join(extractedDir, "repo2.git")
-	err = os.MkdirAll(gitDir1, 0755)
-	require.NoError(t, err)
-	err = os.MkdirAll(gitDir2, 0755)
-	require.NoError(t, err)
-
-	_, err = wd.BareRepoPath()
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "multiple .git directories found")
-}
-
-func TestBareRepoPath_ExtractedNotExists(t *testing.T) {
-	tmpDir := t.TempDir()
-	wd, err := New(tmpDir)
-	require.NoError(t, err)
-
-	// Don't create extracted directory
-	_, err = wd.BareRepoPath()
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "extracted directory does not exist")
+	for suffix, path := range paths {
+		t.Run(suffix, func(t *testing.T) {
+			assert.True(t, filepath.IsAbs(path))
+			assert.Equal(t, filepath.Join(tmpDir, suffix), path)
+		})
+	}
 }
 
 func TestIdempotencyHelpers(t *testing.T) {
@@ -126,19 +72,16 @@ func TestIdempotencyHelpers(t *testing.T) {
 	require.NoError(t, err)
 
 	// Initially, no files exist
-	assert.False(t, wd.HasArchive())
 	assert.False(t, wd.HasCommitMap())
 	assert.False(t, wd.HasGitArchive())
 	assert.False(t, wd.HasMetadataArchive())
 
 	// Create files
-	os.WriteFile(wd.Archive(), []byte("test"), 0644)
-	os.WriteFile(wd.CommitMap(), []byte("test"), 0644)
-	os.WriteFile(wd.GitArchive(), []byte("test"), 0644)
-	os.WriteFile(wd.MetadataArchive(), []byte("test"), 0644)
+	require.NoError(t, os.WriteFile(wd.CommitMap(), []byte("test"), 0644))
+	require.NoError(t, os.WriteFile(wd.GitArchive(), []byte("test"), 0644))
+	require.NoError(t, os.WriteFile(wd.MetadataArchive(), []byte("test"), 0644))
 
 	// Now they should exist
-	assert.True(t, wd.HasArchive())
 	assert.True(t, wd.HasCommitMap())
 	assert.True(t, wd.HasGitArchive())
 	assert.True(t, wd.HasMetadataArchive())
@@ -159,6 +102,21 @@ func TestLock_Success(t *testing.T) {
 
 	// Clean up
 	wd.Unlock()
+}
+
+func TestLock_SweepsPartials(t *testing.T) {
+	tmpDir := t.TempDir()
+	wd, err := New(tmpDir)
+	require.NoError(t, err)
+
+	partialPath := filepath.Join(tmpDir, "git_archive_raw.tar.gz.partial")
+	require.NoError(t, os.WriteFile(partialPath, []byte("interrupted"), 0644))
+
+	require.NoError(t, wd.Lock())
+	defer wd.Unlock()
+
+	_, err = os.Stat(partialPath)
+	assert.True(t, os.IsNotExist(err))
 }
 
 func TestLock_AlreadyLocked(t *testing.T) {
