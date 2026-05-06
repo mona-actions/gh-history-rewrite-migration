@@ -13,14 +13,6 @@ import (
 	"github.com/spf13/viper"
 )
 
-// outputLogger adapts the output package's package-level printers to the
-// Logger interfaces consumed by filterrepo / largefiles / rewriter.
-type outputLogger struct{}
-
-func (outputLogger) Info(m string)  { output.Info(m) }
-func (outputLogger) Warn(m string)  { output.Warn(m) }
-func (outputLogger) Error(m string) { output.Error(m) }
-
 // rewriteCmd implements the standalone `rewrite` subcommand.
 var rewriteCmd = &cobra.Command{
 	Use:   "rewrite",
@@ -82,7 +74,7 @@ func runRewrite(cmd *cobra.Command, _ []string) error {
 	yes, _ := cmd.Flags().GetBool("yes")
 	nonInteractive, _ := cmd.Flags().GetBool("non-interactive")
 
-	log := outputLogger{}
+	log := output.PackageLogger{}
 	runner := filterrepo.New(filterrepo.DefaultExecer{}, log)
 	analyzer := largefiles.New(runner, log, threshold)
 

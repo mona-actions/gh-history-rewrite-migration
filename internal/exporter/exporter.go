@@ -1,12 +1,8 @@
-// Package exporter orchestrates the export phase of the migration: it starts
-// an org migration via the GitHub REST migrations API, polls until the
-// archive is ready, downloads the combined tarball, extracts it into the
-// work directory, and locates the bare repository for downstream rewriting.
+// Package exporter orchestrates the export phase of the migration. It produces
+// the raw git and metadata archives consumed by downstream v2 phases.
 package exporter
 
 import (
-	"archive/tar"
-	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
@@ -15,28 +11,61 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
+	commitarchive "github.com/mona-actions/gh-commit-remap/pkg/archive"
 	"github.com/mona-actions/gh-history-rewrite-migration/internal/api"
+	"github.com/mona-actions/gh-history-rewrite-migration/internal/atomicfs"
 	"github.com/mona-actions/gh-history-rewrite-migration/internal/output"
 	"github.com/mona-actions/gh-history-rewrite-migration/internal/workdir"
 )
 
+// Mode selects how exporter obtains the two raw archives.
+type Mode int
+
+const (
+	ModeTwo Mode = iota
+	ModeCombined
+)
+
+// SharedRootFiles are duplicated into both split archives in combined mode.
+var SharedRootFiles = []string{"organizations_", "repositories_", "schema.json"}
+
+// ParseMode parses an export mode string.
+func ParseMode(s string) (Mode, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "two":
+		return ModeTwo, nil
+	case "combined":
+		return ModeCombined, nil
+	default:
+		return ModeTwo, fmt.Errorf("invalid export mode %q (want two or combined)", s)
+	}
+}
+
+func (m Mode) String() string {
+	switch m {
+	case ModeTwo:
+		return "two"
+	case ModeCombined:
+		return "combined"
+	default:
+		return fmt.Sprintf("Mode(%d)", int(m))
+	}
+}
+
 // Config carries user-tunable export parameters wired from cobra/viper flags.
 type Config struct {
-	// Org is the source organization that owns the repository.
-	Org string
-	// Repo is the source repository name (without the owner prefix).
-	Repo string
-	// LockRepositories locks the source repos for the duration of the migration.
-	LockRepositories bool
-	// ExcludeAttachments omits issue/PR attachments from the archive.
+	Org                string
+	Repo               string
+	Mode               Mode
+	LockRepositories   bool
+	ExcludeReleases    bool
 	ExcludeAttachments bool
 }
 
 // migrationsClient is the subset of api.API methods Exporter depends on.
-// It exists so tests can substitute a fake without spinning up an HTTPS
-// listener with a custom transport. *api.API satisfies it directly.
 type migrationsClient interface {
 	StartOrgMigration(ctx context.Context, org string, opts api.MigrationOpts) (int64, error)
 	GetMigration(ctx context.Context, org string, id int64) (*api.Migration, error)
@@ -44,13 +73,12 @@ type migrationsClient interface {
 	DeleteMigrationArchive(ctx context.Context, org string, id int64) error
 }
 
-// Exporter drives the full one-archive export flow.
+// Exporter drives the v2 export flow.
 type Exporter struct {
 	api migrationsClient
 	wd  *workdir.WorkDir
 	cfg Config
 
-	// Test hooks — set by tests to control timing.
 	pollInitial time.Duration
 	pollMax     time.Duration
 	now         func() time.Time
@@ -68,78 +96,23 @@ func New(a *api.API, wd *workdir.WorkDir, cfg Config) *Exporter {
 	}
 }
 
-// Run executes the full export pipeline:
-//  1. idempotency check (skip if archive + extracted bare repo already present)
-//  2. start org migration
-//  3. poll with exponential backoff + jitter until exported / failed
-//  4. download archive
-//  5. extract tarball (zip-slip safe)
-//  6. detect bare repo (errors if multi-repo)
-//  7. best-effort delete remote archive
 func (e *Exporter) Run(ctx context.Context) error {
 	if err := e.validateConfig(); err != nil {
 		return err
 	}
-
-	// 1. idempotency
-	if e.wd.HasArchive() {
-		if _, err := e.wd.BareRepoPath(); err == nil {
-			output.Info("archive already present, skipping export")
-			return nil
-		}
-		// Archive exists but extraction is missing/broken — re-extract from
-		// the cached archive instead of re-downloading.
-		output.Info("archive present but not extracted; re-extracting")
-		if err := os.RemoveAll(e.wd.Extracted()); err != nil {
-			return fmt.Errorf("failed to clean stale extracted dir: %w", err)
-		}
-		if err := Extract(e.wd.Archive(), e.wd.Extracted()); err != nil {
-			return fmt.Errorf("failed to extract cached archive: %w", err)
-		}
-		return e.assertSingleRepo()
-	}
-
-	// 2. start migration
-	repoSlug := fmt.Sprintf("%s/%s", e.cfg.Org, e.cfg.Repo)
-	output.Info(fmt.Sprintf("starting org migration for %s", repoSlug))
-
-	migrationID, err := e.api.StartOrgMigration(ctx, e.cfg.Org, api.MigrationOpts{
-		Repositories:       []string{repoSlug},
-		LockRepositories:   e.cfg.LockRepositories,
-		ExcludeAttachments: e.cfg.ExcludeAttachments,
-	})
+	mode, err := e.loadOrInitMode(e.cfg.Mode)
 	if err != nil {
-		return fmt.Errorf("failed to start migration: %w", err)
-	}
-
-	// 3. poll
-	if err := e.pollUntilExported(ctx, migrationID); err != nil {
 		return err
 	}
 
-	// 4. download
-	if err := e.downloadWithProgress(ctx, migrationID); err != nil {
-		return fmt.Errorf("failed to download archive: %w", err)
+	switch mode {
+	case ModeTwo:
+		return e.runTwoMode(ctx)
+	case ModeCombined:
+		return e.runCombinedMode(ctx)
+	default:
+		return fmt.Errorf("unsupported export mode %s", mode.String())
 	}
-
-	// 5. extract
-	output.Info("extracting archive")
-	if err := Extract(e.wd.Archive(), e.wd.Extracted()); err != nil {
-		return fmt.Errorf("failed to extract archive: %w", err)
-	}
-
-	// 6. multi-repo detect
-	if err := e.assertSingleRepo(); err != nil {
-		return err
-	}
-
-	// 7. best-effort cleanup
-	if err := e.api.DeleteMigrationArchive(ctx, e.cfg.Org, migrationID); err != nil {
-		output.Warn(fmt.Sprintf("failed to delete remote migration archive (best-effort): %v", err))
-	}
-
-	output.Success("export complete")
-	return nil
 }
 
 func (e *Exporter) validateConfig() error {
@@ -152,33 +125,155 @@ func (e *Exporter) validateConfig() error {
 	return nil
 }
 
-// assertSingleRepo wraps wd.BareRepoPath errors with a v1 user-friendly
-// message when multiple .git directories are detected.
-//
-// TODO: replace the substring match with a typed sentinel error exported
-// from internal/workdir (e.g., workdir.ErrMultipleRepos) once that package
-// is in scope to modify. The current coupling to wd's error wording will
-// silently regress to a raw error if BareRepoPath's phrasing ever changes.
-// See architecture review F1 (intentionally deferred — workdir is outside
-// the modify scope of the export task).
-func (e *Exporter) assertSingleRepo() error {
-	_, err := e.wd.BareRepoPath()
-	if err == nil {
-		return nil
+func (e *Exporter) loadOrInitMode(wantMode Mode) (Mode, error) {
+	path := e.wd.ExportModeFile()
+	if data, err := os.ReadFile(path); err == nil {
+		got, parseErr := ParseMode(string(data))
+		if parseErr != nil {
+			return ModeTwo, fmt.Errorf("invalid export mode marker %s: %w", path, parseErr)
+		}
+		if got != wantMode {
+			return got, fmt.Errorf("this work-dir was started in %s mode but current export mode is %s; pass --export-mode %s or use a fresh --work-dir", got.String(), wantMode.String(), got.String())
+		}
+		return got, nil
+	} else if !os.IsNotExist(err) {
+		return ModeTwo, fmt.Errorf("read export mode marker: %w", err)
 	}
-	if strings.Contains(err.Error(), "multiple .git directories") {
-		return fmt.Errorf("this archive contains multiple repos; v1 supports single-repo migrations only — open an issue if you need multi-repo support: %w", err)
+
+	if err := atomicfs.WriteFileAtomic(path, func(w io.Writer) error {
+		_, err := io.WriteString(w, wantMode.String()+"\n")
+		return err
+	}); err != nil {
+		return ModeTwo, fmt.Errorf("write export mode marker: %w", err)
 	}
-	return err
+	return wantMode, nil
 }
 
-// pollUntilExported polls migration state with exponential backoff (capped)
-// and jitter until state == "exported", an error occurs, or context is done.
+func (e *Exporter) runTwoMode(ctx context.Context) error {
+	base := e.baseToggles()
+	repo := e.repoSlug()
+	if !archiveComplete(e.wd.RawGitArchive()) {
+		if err := e.runMigration(ctx, api.GitOnlyMigrationOpts(repo), e.wd.RawGitArchive()); err != nil {
+			return err
+		}
+	}
+	if !archiveComplete(e.wd.RawMetadataArchive()) {
+		if err := e.runMigration(ctx, api.MetadataOnlyMigrationOpts(repo, base), e.wd.RawMetadataArchive()); err != nil {
+			return err
+		}
+	}
+	output.Success("export complete")
+	return nil
+}
+
+func (e *Exporter) runCombinedMode(ctx context.Context) error {
+	rawCombined := e.wd.CombinedRawArchive()
+	if atomicfs.IsDirComplete(e.wd.GitExtractedDir()) && atomicfs.IsDirComplete(e.wd.MetadataExtractedDir()) {
+		_ = os.Remove(rawCombined)
+		output.Success("export complete")
+		return nil
+	}
+
+	if !archiveComplete(rawCombined) {
+		if err := e.runMigration(ctx, api.CombinedMigrationOpts(e.repoSlug(), e.baseToggles()), rawCombined); err != nil {
+			return err
+		}
+	}
+
+	splitDir := e.wd.CombinedSplitDir()
+	if err := os.RemoveAll(splitDir); err != nil {
+		return err
+	}
+	if _, err := commitarchive.UnTar(rawCombined, splitDir); err != nil {
+		return fmt.Errorf("extract combined archive: %w", err)
+	}
+	if err := atomicfs.MarkDirComplete(splitDir); err != nil {
+		return err
+	}
+
+	extractRoot, err := workdir.DescendIntoSingleSubdir(splitDir)
+	if err != nil {
+		return err
+	}
+	bareRepo, err := workdir.FindBareRepo(extractRoot)
+	if err != nil {
+		return err
+	}
+
+	gitStage := e.wd.GitStageDir()
+	metaStage := e.wd.MetaStageDir()
+	if err := os.RemoveAll(gitStage); err != nil {
+		return err
+	}
+	if err := os.RemoveAll(metaStage); err != nil {
+		return err
+	}
+	if err := splitTree(extractRoot, bareRepo, gitStage, metaStage); err != nil {
+		return err
+	}
+
+	if err := replaceCompleteDir(gitStage, e.wd.GitExtractedDir()); err != nil {
+		return err
+	}
+	if err := replaceCompleteDir(metaStage, e.wd.MetadataExtractedDir()); err != nil {
+		return err
+	}
+
+	_ = os.RemoveAll(splitDir)
+	_ = os.Remove(rawCombined)
+	output.Success("export complete")
+	return nil
+}
+
+func (e *Exporter) runMigration(ctx context.Context, opts api.MigrationOpts, outPath string) (err error) {
+	output.Info(fmt.Sprintf("starting org migration for %s", strings.Join(opts.Repositories, ",")))
+	migrationID, err := e.api.StartOrgMigration(ctx, e.cfg.Org, opts)
+	if err != nil {
+		return fmt.Errorf("failed to start migration: %w", err)
+	}
+	defer func() {
+		if ctx.Err() != nil {
+			return
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if cleanupErr := e.api.DeleteMigrationArchive(cleanupCtx, e.cfg.Org, migrationID); cleanupErr != nil {
+			output.Warn(fmt.Sprintf("failed to delete remote migration archive (best-effort): %v", cleanupErr))
+		}
+	}()
+
+	if err := e.pollUntilExported(ctx, migrationID); err != nil {
+		return err
+	}
+	if err := e.downloadArchive(ctx, migrationID, outPath); err != nil {
+		return fmt.Errorf("failed to download archive: %w", err)
+	}
+	if err := atomicfs.ValidateTarHeader(outPath); err != nil {
+		_ = os.Remove(outPath)
+		return fmt.Errorf("downloaded archive failed validation: %w", err)
+	}
+	return nil
+}
+
+func (e *Exporter) baseToggles() api.BaseToggles {
+	return api.BaseToggles{
+		ExcludeReleases:    e.cfg.ExcludeReleases,
+		ExcludeAttachments: e.cfg.ExcludeAttachments,
+		LockRepositories:   e.cfg.LockRepositories,
+	}
+}
+
+func (e *Exporter) repoSlug() string {
+	return fmt.Sprintf("%s/%s", e.cfg.Org, e.cfg.Repo)
+}
+
+func archiveComplete(path string) bool {
+	return atomicfs.IsFileComplete(path) && atomicfs.ValidateTarHeader(path) == nil
+}
+
 func (e *Exporter) pollUntilExported(ctx context.Context, id int64) error {
 	spinner := output.Spinner("waiting for migration to be exported (state: pending)")
 	defer func() {
-		// Belt-and-suspenders: if the caller didn't transition the spinner
-		// (e.g., we returned via error), stop it cleanly.
 		if spinner.IsActive {
 			_ = spinner.Stop()
 		}
@@ -186,14 +281,12 @@ func (e *Exporter) pollUntilExported(ctx context.Context, id int64) error {
 
 	delay := e.pollInitial
 	rng := rand.New(rand.NewSource(e.now().UnixNano()))
-
 	for {
 		m, err := e.api.GetMigration(ctx, e.cfg.Org, id)
 		if err != nil {
 			spinner.Fail("migration poll failed")
 			return fmt.Errorf("failed to poll migration: %w", err)
 		}
-
 		switch m.State {
 		case "exported":
 			spinner.Success("archive ready for download")
@@ -202,23 +295,19 @@ func (e *Exporter) pollUntilExported(ctx context.Context, id int64) error {
 			spinner.Fail("migration failed")
 			return fmt.Errorf("migration %d entered failed state", id)
 		default:
-			// pending, exporting, or any unrecognized intermediate state —
-			// keep polling and surface the state in the spinner.
 			spinner.UpdateText(fmt.Sprintf("waiting for migration to be exported (state: %s)", m.State))
 		}
 
-		// Sleep with jitter, respecting context cancellation.
-		jitter := time.Duration(rng.Int63n(int64(delay) / 4))
-		sleep := delay + jitter
-
+		jitter := time.Duration(0)
+		if delay > 0 {
+			jitter = time.Duration(rng.Int63n(int64(delay)/4 + 1))
+		}
 		select {
 		case <-ctx.Done():
 			spinner.Fail("migration poll cancelled")
 			return ctx.Err()
-		case <-time.After(sleep):
+		case <-time.After(delay + jitter):
 		}
-
-		// Exponential backoff up to cap.
 		delay *= 2
 		if delay > e.pollMax {
 			delay = e.pollMax
@@ -226,164 +315,137 @@ func (e *Exporter) pollUntilExported(ctx context.Context, id int64) error {
 	}
 }
 
-// downloadWithProgress downloads the migration archive and reports progress
-// via a spinner. It uses a tee pipeline so we never load the archive in
-// memory; bytes are streamed to disk by the underlying api client and the
-// progress count is computed from the file size on tick.
-func (e *Exporter) downloadWithProgress(ctx context.Context, id int64) error {
+func (e *Exporter) downloadArchive(ctx context.Context, id int64, outPath string) error {
 	spinner := output.Spinner("downloading archive")
-
-	// Tick goroutine: poll the file size while the download is in flight.
-	done := make(chan struct{})
-	go func() {
-		ticker := time.NewTicker(2 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-done:
-				return
-			case <-ticker.C:
-				if fi, err := os.Stat(e.wd.Archive()); err == nil {
-					mb := fi.Size() / (1024 * 1024)
-					spinner.UpdateText(fmt.Sprintf("downloading archive (%d MB)", mb))
-				}
-			}
-		}
-	}()
-
-	err := e.api.DownloadArchive(ctx, e.cfg.Org, id, e.wd.Archive())
-	close(done)
+	err := atomicfs.WriteFileAtomicPath(outPath, func(partialPath string) error {
+		return e.api.DownloadArchive(ctx, e.cfg.Org, id, partialPath)
+	})
 	if err != nil {
 		spinner.Fail("download failed")
-		// Clean up partial file so idempotency check on retry doesn't trip.
-		_ = os.Remove(e.wd.Archive())
 		return err
 	}
-
-	if fi, err := os.Stat(e.wd.Archive()); err == nil {
-		mb := fi.Size() / (1024 * 1024)
-		spinner.Success(fmt.Sprintf("downloaded archive (%d MB)", mb))
+	if fi, statErr := os.Stat(outPath); statErr == nil {
+		spinner.Success(fmt.Sprintf("downloaded archive (%d MB)", fi.Size()/(1024*1024)))
 	} else {
 		spinner.Success("downloaded archive")
 	}
 	return nil
 }
 
-// Extract extracts a gzipped tarball at archivePath into destDir. It creates
-// destDir if needed and protects against zip-slip by rejecting any entry
-// whose resolved path falls outside destDir. Symlinks pointing outside
-// destDir are also rejected.
-func Extract(archivePath, destDir string) error {
-	f, err := os.Open(archivePath)
+func splitTree(extractRoot, bareRepo, gitStage, metaStage string) error {
+	relBare, err := filepath.Rel(extractRoot, bareRepo)
 	if err != nil {
-		return fmt.Errorf("failed to open archive: %w", err)
+		return err
 	}
-	defer f.Close()
+	if relBare == "." || strings.HasPrefix(relBare, "..") || filepath.IsAbs(relBare) {
+		return fmt.Errorf("bare repo %s is not under extract root %s", bareRepo, extractRoot)
+	}
+	parts := strings.Split(filepath.ToSlash(relBare), "/")
+	if len(parts) < 3 || parts[0] != "repositories" {
+		return fmt.Errorf("bare repo %s is not under repositories/", bareRepo)
+	}
+	if err := os.MkdirAll(gitStage, 0o755); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(metaStage, 0o755); err != nil {
+		return err
+	}
 
-	gz, err := gzip.NewReader(f)
+	entries, err := os.ReadDir(extractRoot)
 	if err != nil {
-		return fmt.Errorf("failed to open gzip stream: %w", err)
+		return err
 	}
-	defer gz.Close()
-
-	if err := os.MkdirAll(destDir, 0o755); err != nil {
-		return fmt.Errorf("failed to create dest dir: %w", err)
-	}
-
-	absDest, err := filepath.Abs(destDir)
-	if err != nil {
-		return fmt.Errorf("failed to resolve dest dir: %w", err)
-	}
-
-	tr := tar.NewReader(gz)
-	for {
-		hdr, err := tr.Next()
-		if err == io.EOF {
-			return nil
+	for _, entry := range entries {
+		name := entry.Name()
+		if name == ".complete" {
+			continue
 		}
-		if err != nil {
-			return fmt.Errorf("failed to read tar entry: %w", err)
-		}
-
-		// Resolve target path and validate it stays within destDir.
-		target := filepath.Join(absDest, hdr.Name)
-		absTarget, err := filepath.Abs(target)
-		if err != nil {
-			return fmt.Errorf("failed to resolve entry path %q: %w", hdr.Name, err)
-		}
-		if !isWithin(absDest, absTarget) {
-			return fmt.Errorf("zip-slip: tar entry %q resolves outside destination", hdr.Name)
-		}
-
-		switch hdr.Typeflag {
-		case tar.TypeDir:
-			if err := os.MkdirAll(absTarget, fileModeFromHeader(hdr.Mode, 0o755)); err != nil {
-				return fmt.Errorf("failed to create dir %q: %w", hdr.Name, err)
+		src := filepath.Join(extractRoot, name)
+		switch {
+		case isSharedRootFile(name):
+			if entry.IsDir() {
+				return fmt.Errorf("shared root entry %s is a directory", name)
 			}
-		case tar.TypeReg, tar.TypeRegA: //nolint:staticcheck // TypeRegA needed for old archives
-			if err := os.MkdirAll(filepath.Dir(absTarget), 0o755); err != nil {
-				return fmt.Errorf("failed to create parent dir for %q: %w", hdr.Name, err)
+			if err := copyPath(src, filepath.Join(gitStage, name)); err != nil {
+				return err
 			}
-			out, err := os.OpenFile(absTarget, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, fileModeFromHeader(hdr.Mode, 0o644))
-			if err != nil {
-				return fmt.Errorf("failed to create file %q: %w", hdr.Name, err)
+			if err := copyPath(src, filepath.Join(metaStage, name)); err != nil {
+				return err
 			}
-			// Cap copy to declared size to avoid decompression bombs.
-			// hdr.Size is authoritative for regular files; LimitReader
-			// guards against a malicious tar that lies in its header.
-			if hdr.Size < 0 {
-				out.Close()
-				return fmt.Errorf("invalid negative size in tar entry %q", hdr.Name)
+		case name == "repositories":
+			if !entry.IsDir() {
+				return fmt.Errorf("repositories is not a directory")
 			}
-			if _, err := io.Copy(out, io.LimitReader(tr, hdr.Size)); err != nil {
-				out.Close()
-				return fmt.Errorf("failed to write file %q: %w", hdr.Name, err)
-			}
-			out.Close()
-		case tar.TypeSymlink:
-			// Resolve the symlink target relative to the link's directory and
-			// reject if it escapes destDir.
-			linkTarget := hdr.Linkname
-			resolved := linkTarget
-			if !filepath.IsAbs(resolved) {
-				resolved = filepath.Join(filepath.Dir(absTarget), linkTarget)
-			}
-			absResolved, err := filepath.Abs(resolved)
-			if err != nil {
-				return fmt.Errorf("failed to resolve symlink %q: %w", hdr.Name, err)
-			}
-			if !isWithin(absDest, absResolved) {
-				return fmt.Errorf("zip-slip: symlink %q -> %q resolves outside destination", hdr.Name, linkTarget)
-			}
-			if err := os.MkdirAll(filepath.Dir(absTarget), 0o755); err != nil {
-				return fmt.Errorf("failed to create parent dir for symlink %q: %w", hdr.Name, err)
-			}
-			// Best-effort: remove an existing entry so Symlink doesn't fail.
-			_ = os.Remove(absTarget)
-			if err := os.Symlink(linkTarget, absTarget); err != nil {
-				return fmt.Errorf("failed to create symlink %q: %w", hdr.Name, err)
+			if err := movePath(src, filepath.Join(gitStage, name)); err != nil {
+				return err
 			}
 		default:
-			// Skip other entry types (hardlinks, devices, fifos) — not
-			// expected in GitHub migration archives.
+			if err := movePath(src, filepath.Join(metaStage, name)); err != nil {
+				return err
+			}
 		}
 	}
+	return nil
 }
 
-// isWithin reports whether target is equal to or a descendant of root.
-// Both paths must be absolute and cleaned.
-func isWithin(root, target string) bool {
-	rootClean := filepath.Clean(root) + string(filepath.Separator)
-	targetClean := filepath.Clean(target)
-	if targetClean == filepath.Clean(root) {
+func isSharedRootFile(name string) bool {
+	for _, shared := range SharedRootFiles {
+		if strings.HasSuffix(shared, ".json") {
+			if name == shared {
+				return true
+			}
+			continue
+		}
+		if strings.HasPrefix(name, shared) && strings.HasSuffix(name, ".json") {
+			return true
+		}
+	}
+	return false
+}
+
+func movePath(src, dst string) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	if err := os.Rename(src, dst); err == nil {
+		return nil
+	} else if !isCrossDevice(err) {
+		return err
+	}
+	if err := atomicfs.CopyTree(src, dst); err != nil {
+		return err
+	}
+	return os.RemoveAll(src)
+}
+
+func replaceCompleteDir(src, dst string) error {
+	if atomicfs.IsDirComplete(dst) {
+		return nil
+	}
+	if err := os.RemoveAll(dst); err != nil {
+		return err
+	}
+	if err := movePath(src, dst); err != nil {
+		return err
+	}
+	return atomicfs.MarkDirComplete(dst)
+}
+
+func isCrossDevice(err error) bool {
+	if errors.Is(err, syscall.EXDEV) {
 		return true
 	}
-	return strings.HasPrefix(targetClean, rootClean)
+	var linkErr *os.LinkError
+	return errors.As(err, &linkErr) && errors.Is(linkErr.Err, syscall.EXDEV)
 }
 
-func fileModeFromHeader(mode int64, fallback os.FileMode) os.FileMode {
-	if mode == 0 {
-		return fallback
+func copyPath(src, dst string) error {
+	info, err := os.Lstat(src)
+	if err != nil {
+		return err
 	}
-	return os.FileMode(mode) & os.ModePerm
+	if info.IsDir() {
+		return atomicfs.CopyTree(src, dst)
+	}
+	return atomicfs.CopyFile(src, dst)
 }

@@ -32,18 +32,18 @@ type fakeRewriter struct {
 	err    error
 }
 
-func (f *fakeRewriter) Run(ctx context.Context) (*rewriter.Result, error) {
+func (f *fakeRewriter) Run(ctx context.Context, inputs ...rewriter.Input) (*rewriter.Result, error) {
 	f.called = true
 	return f.res, f.err
 }
 
 type fakeRemapper struct {
 	called bool
-	res    *remap.Result
+	res    remap.Result
 	err    error
 }
 
-func (f *fakeRemapper) Run(ctx context.Context, in remap.Input) (*remap.Result, error) {
+func (f *fakeRemapper) Run(ctx context.Context, in remap.Input) (remap.Result, error) {
 	f.called = true
 	return f.res, f.err
 }
@@ -101,7 +101,7 @@ func TestRun_HappyPath(t *testing.T) {
 	d := &fakeDoctor{}
 	e := &fakeExporter{}
 	rw := &fakeRewriter{res: &rewriter.Result{StripPerformed: true}}
-	rm := &fakeRemapper{res: &remap.Result{}}
+	rm := &fakeRemapper{res: remap.Result{}}
 	im := &fakeImporter{}
 
 	o, rec := build(t, d, e, rw, rm, im, Config{TargetRepoURL: "https://github.com/x/y"})
@@ -157,7 +157,7 @@ func TestRun_ExporterFails_AbortsBeforeRewriteRemapImport(t *testing.T) {
 func TestRun_RewriterIdempotentSkip_ContinuesToRemap(t *testing.T) {
 	e := &fakeExporter{}
 	rw := &fakeRewriter{res: nil, err: nil} // nil/nil = idempotent skip
-	rm := &fakeRemapper{res: &remap.Result{}}
+	rm := &fakeRemapper{res: remap.Result{}}
 	im := &fakeImporter{}
 
 	o, rec := build(t, nil, e, rw, rm, im, Config{})
@@ -177,7 +177,7 @@ func TestRun_RewriterWarningsRendered(t *testing.T) {
 	rw := &fakeRewriter{res: &rewriter.Result{
 		Warnings: []string{"GPG signatures stripped", "LFS pointers detected"},
 	}}
-	rm := &fakeRemapper{res: &remap.Result{}}
+	rm := &fakeRemapper{res: remap.Result{}}
 	im := &fakeImporter{}
 
 	o, rec := build(t, nil, e, rw, rm, im, Config{})
@@ -190,22 +190,19 @@ func TestRun_RewriterWarningsRendered(t *testing.T) {
 	}
 }
 
-func TestRun_RemapUpstreamPending_AbortsBeforeImport(t *testing.T) {
+func TestRun_RemapError_AbortsBeforeImport(t *testing.T) {
 	e := &fakeExporter{}
 	rw := &fakeRewriter{res: &rewriter.Result{}}
-	rm := &fakeRemapper{err: remap.ErrUpstreamPending}
+	rm := &fakeRemapper{err: errors.New("metadata remap failed")}
 	im := &fakeImporter{}
 
-	o, rec := build(t, nil, e, rw, rm, im, Config{})
+	o, _ := build(t, nil, e, rw, rm, im, Config{})
 	err := o.Run(context.Background())
-	if !errors.Is(err, remap.ErrUpstreamPending) {
-		t.Fatalf("expected ErrUpstreamPending, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "remap phase failed") {
+		t.Fatalf("expected wrapped remap failure, got %v", err)
 	}
 	if im.called {
-		t.Errorf("importer must NOT run when remap is pending upstream")
-	}
-	if !strings.Contains(rec.joined(), "MANUAL-REMAP.md") {
-		t.Errorf("expected manual-remap pointer in warning, got: %s", rec.joined())
+		t.Errorf("importer must NOT run when remap fails")
 	}
 }
 
@@ -228,7 +225,7 @@ func TestRun_RemapOtherError_Aborts(t *testing.T) {
 func TestRun_ImporterFails_ReturnsError(t *testing.T) {
 	e := &fakeExporter{}
 	rw := &fakeRewriter{res: &rewriter.Result{}}
-	rm := &fakeRemapper{res: &remap.Result{}}
+	rm := &fakeRemapper{res: remap.Result{}}
 	im := &fakeImporter{err: errors.New("gei exit 1")}
 
 	o, _ := build(t, nil, e, rw, rm, im, Config{})
@@ -247,7 +244,7 @@ func TestNew_NilPrintersAreNoOp(t *testing.T) {
 	// Construct with empty Printers and ensure Run doesn't panic.
 	o := New(nil, nil,
 		&fakeExporter{}, &fakeRewriter{res: &rewriter.Result{}},
-		&fakeRemapper{res: &remap.Result{}}, &fakeImporter{},
+		&fakeRemapper{res: remap.Result{}}, &fakeImporter{},
 		remap.Input{}, Config{}, Printers{})
 	if err := o.Run(context.Background()); err != nil {
 		t.Fatalf("unexpected error with nil printers: %v", err)

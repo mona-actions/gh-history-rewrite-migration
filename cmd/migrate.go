@@ -20,14 +20,6 @@ import (
 	"github.com/spf13/viper"
 )
 
-// remapLogger adapts internal/output's Info/Warn package functions to
-// the remap.Logger interface. Defined here (rather than in remap) so
-// the remap package stays free of any output dependency.
-type remapLogger struct{}
-
-func (remapLogger) Info(m string) { output.Info(m) }
-func (remapLogger) Warn(m string) { output.Warn(m) }
-
 // migrateCmd is the PRIMARY user-facing command. It chains the four
 // migration phases (export → rewrite → remap → import) plus an optional
 // preflight (doctor) into a single end-to-end run.
@@ -79,6 +71,8 @@ func init() {
 	migrateCmd.Flags().Bool("exclude-metadata", false, "Exclude issue/PR metadata from the archive")
 	migrateCmd.Flags().Bool("exclude-attachments", false, "Exclude issue/PR attachments from the archive")
 	migrateCmd.Flags().Bool("lock-repositories", false, "Lock source repositories during migration")
+	migrateCmd.Flags().String("export-mode", "two", "Export mode: two or combined")
+	viper.BindPFlag("EXPORT_MODE", migrateCmd.Flags().Lookup("export-mode"))
 
 	// Phase: rewrite.
 	migrateCmd.Flags().Bool("strip-large-files", false, "Analyze the repo and strip files exceeding --large-file-threshold")
@@ -175,11 +169,18 @@ func runMigrate(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("failed to construct API client: %w", err)
 	}
 	exclAttachments, _ := cmd.Flags().GetBool("exclude-attachments")
+	exclReleases, _ := cmd.Flags().GetBool("exclude-releases")
 	lockRepos, _ := cmd.Flags().GetBool("lock-repositories")
+	mode, err := exporter.ParseMode(viper.GetString("EXPORT_MODE"))
+	if err != nil {
+		return err
+	}
 	exp := exporter.New(apiClient, wd, exporter.Config{
 		Org:                viper.GetString("ORG"),
 		Repo:               viper.GetString("REPO"),
+		Mode:               mode,
 		LockRepositories:   lockRepos,
+		ExcludeReleases:    exclReleases,
 		ExcludeAttachments: exclAttachments,
 	})
 
@@ -188,7 +189,7 @@ func runMigrate(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return fmt.Errorf("invalid --large-file-threshold: %w", err)
 	}
-	log := outputLogger{} // defined in cmd/rewrite.go
+	log := output.PackageLogger{}
 	frRunner := filterrepo.New(filterrepo.DefaultExecer{}, log)
 	analyzer := largefiles.New(frRunner, log, threshold)
 	rw := rewriter.New(wd, frRunner, analyzer, log, rewriter.Config{
@@ -200,9 +201,8 @@ func runMigrate(cmd *cobra.Command, _ []string) error {
 		NonInteractive:     nonInteractive,
 	})
 
-	// Phase 3: remapper (stub for now; swap to a real impl once
-	// gh-commit-remap publishes pkg/).
-	remapper := remap.NewStub(remapLogger{})
+	// Phase 3: remapper.
+	remapper := remap.NewReal(output.PackageLogger{})
 
 	// Phase 4: importer.
 	imp := importer.New(wd, importer.Config{
@@ -212,14 +212,11 @@ func runMigrate(cmd *cobra.Command, _ []string) error {
 		Confirm:        confirm,
 	}, nil)
 
-	// Construct remap input. BareRepoPath isn't yet known at
-	// orchestration time (extraction happens during export); the
-	// stub doesn't read it, and the real remapper will resolve it
-	// itself via wd.BareRepoPath() so we leave it empty here.
 	remapIn := remap.Input{
-		WorkDir:       wd,
-		CommitMapPath: wd.CommitMap(),
-		ExtractedDir:  wd.Extracted(),
+		WorkDir:              wd,
+		RawMetadataArchive:   wd.RawMetadataArchive(),
+		CommitMapPath:        wd.CommitMap(),
+		MetadataExtractedDir: wd.MetadataExtractedDir(),
 	}
 
 	// NonInteractive is already plumbed into rewriter.Config above;

@@ -56,6 +56,7 @@ func init() {
 	viper.SetDefault("WORK_DIR", "./work")
 	viper.SetDefault("SOURCE_HOSTNAME", "github.com")
 	viper.SetDefault("LARGE_FILE_THRESHOLD", "400M")
+	viper.SetDefault("EXPORT_MODE", "two")
 
 	// Bind environment variables explicitly for PAT authentication
 	viper.BindEnv("GH_SOURCE_PAT")
