@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -71,4 +72,25 @@ func checkRequiredVars(required ...string) error {
 		}
 	}
 	return nil
+}
+
+// resolveWorkDir returns the effective work directory. When --work-dir
+// was not explicitly set (using the default "./work"), the path is
+// auto-namespaced by org/repo so multiple repos can coexist without
+// cleanup. An explicit --work-dir or GHHRM_WORK_DIR is used as-is.
+func resolveWorkDir(cmd *cobra.Command) string {
+	base := viper.GetString("WORK_DIR")
+	org := viper.GetString("ORG")
+	repo := viper.GetString("REPO")
+
+	// If the user explicitly set --work-dir, respect it verbatim.
+	if cmd.Flags().Changed("work-dir") || os.Getenv("GHHRM_WORK_DIR") != "" {
+		return base
+	}
+
+	// Auto-namespace under the default work dir.
+	if org != "" && repo != "" {
+		return filepath.Join(base, org, repo)
+	}
+	return base
 }

@@ -159,11 +159,12 @@ func runMigrate(cmd *cobra.Command, _ []string) error {
 	warnInertExportFlags(cmd)
 
 	// Work-dir + lock.
-	wd, err := workdir.New(viper.GetString("WORK_DIR"))
+	workDirPath := resolveWorkDir(cmd)
+	wd, err := workdir.New(workDirPath)
 	if err != nil {
 		return fmt.Errorf("failed to initialize work directory: %w", err)
 	}
-	output.Info(fmt.Sprintf("Work directory: %s", viper.GetString("WORK_DIR")))
+	output.Info(fmt.Sprintf("Work directory: %s", workDirPath))
 	if err := wd.Lock(); err != nil {
 		return fmt.Errorf("failed to lock work directory: %w", err)
 	}
@@ -177,7 +178,7 @@ func runMigrate(cmd *cobra.Command, _ []string) error {
 	var doctorRunner migrate.DoctorRunner
 	if !skipDoctor {
 		doctorRunner = doctor.New(doctor.Config{
-			WorkDir:        viper.GetString("WORK_DIR"),
+			WorkDir:        workDirPath,
 			SourceHostname: viper.GetString("SOURCE_HOSTNAME"),
 			SourceToken:    sourceToken,
 			TargetToken:    os.Getenv("GH_PAT"),

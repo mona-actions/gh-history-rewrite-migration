@@ -153,12 +153,12 @@ func (e *Exporter) runTwoMode(ctx context.Context) error {
 	base := e.baseToggles()
 	repo := e.repoSlug()
 	if !archiveComplete(e.wd.RawGitArchive()) {
-		if err := e.runMigration(ctx, api.GitOnlyMigrationOpts(repo), e.wd.RawGitArchive()); err != nil {
+		if err := e.runMigration(ctx, api.GitOnlyMigrationOpts(repo), e.wd.RawGitArchive(), "git archive"); err != nil {
 			return err
 		}
 	}
 	if !archiveComplete(e.wd.RawMetadataArchive()) {
-		if err := e.runMigration(ctx, api.MetadataOnlyMigrationOpts(repo, base), e.wd.RawMetadataArchive()); err != nil {
+		if err := e.runMigration(ctx, api.MetadataOnlyMigrationOpts(repo, base), e.wd.RawMetadataArchive(), "metadata archive"); err != nil {
 			return err
 		}
 	}
@@ -175,7 +175,7 @@ func (e *Exporter) runCombinedMode(ctx context.Context) error {
 	}
 
 	if !archiveComplete(rawCombined) {
-		if err := e.runMigration(ctx, api.CombinedMigrationOpts(e.repoSlug(), e.baseToggles()), rawCombined); err != nil {
+		if err := e.runMigration(ctx, api.CombinedMigrationOpts(e.repoSlug(), e.baseToggles()), rawCombined, "combined archive"); err != nil {
 			return err
 		}
 	}
@@ -225,8 +225,8 @@ func (e *Exporter) runCombinedMode(ctx context.Context) error {
 	return nil
 }
 
-func (e *Exporter) runMigration(ctx context.Context, opts api.MigrationOpts, outPath string) (err error) {
-	output.Info(fmt.Sprintf("starting org migration for %s", strings.Join(opts.Repositories, ",")))
+func (e *Exporter) runMigration(ctx context.Context, opts api.MigrationOpts, outPath, label string) (err error) {
+	output.Info(fmt.Sprintf("starting %s migration for %s", label, strings.Join(opts.Repositories, ",")))
 	migrationID, err := e.api.StartOrgMigration(ctx, e.cfg.Org, opts)
 	if err != nil {
 		return fmt.Errorf("failed to start migration: %w", err)
@@ -242,11 +242,11 @@ func (e *Exporter) runMigration(ctx context.Context, opts api.MigrationOpts, out
 		}
 	}()
 
-	if err := e.pollUntilExported(ctx, migrationID); err != nil {
+	if err := e.pollUntilExported(ctx, migrationID, label); err != nil {
 		return err
 	}
-	if err := e.downloadArchive(ctx, migrationID, outPath); err != nil {
-		return fmt.Errorf("failed to download archive: %w", err)
+	if err := e.downloadArchive(ctx, migrationID, outPath, label); err != nil {
+		return fmt.Errorf("failed to download %s: %w", label, err)
 	}
 	if err := atomicfs.ValidateTarHeader(outPath); err != nil {
 		_ = os.Remove(outPath)
@@ -271,8 +271,8 @@ func archiveComplete(path string) bool {
 	return atomicfs.IsFileComplete(path) && atomicfs.ValidateTarHeader(path) == nil
 }
 
-func (e *Exporter) pollUntilExported(ctx context.Context, id int64) error {
-	spinner := output.Spinner("waiting for migration to be exported (state: pending)")
+func (e *Exporter) pollUntilExported(ctx context.Context, id int64, label string) error {
+	spinner := output.Spinner(fmt.Sprintf("waiting for %s to be exported (state: pending)", label))
 	defer func() {
 		if spinner.IsActive {
 			_ = spinner.Stop()
@@ -289,7 +289,7 @@ func (e *Exporter) pollUntilExported(ctx context.Context, id int64) error {
 		}
 		switch m.State {
 		case "exported":
-			spinner.Success("archive ready for download")
+			spinner.Success(fmt.Sprintf("%s ready for download", label))
 			return nil
 		case "failed":
 			spinner.Fail("migration failed")
@@ -315,19 +315,19 @@ func (e *Exporter) pollUntilExported(ctx context.Context, id int64) error {
 	}
 }
 
-func (e *Exporter) downloadArchive(ctx context.Context, id int64, outPath string) error {
-	spinner := output.Spinner("downloading archive")
+func (e *Exporter) downloadArchive(ctx context.Context, id int64, outPath, label string) error {
+	spinner := output.Spinner(fmt.Sprintf("downloading %s", label))
 	err := atomicfs.WriteFileAtomicPath(outPath, func(partialPath string) error {
 		return e.api.DownloadArchive(ctx, e.cfg.Org, id, partialPath)
 	})
 	if err != nil {
-		spinner.Fail("download failed")
+		spinner.Fail(fmt.Sprintf("%s download failed", label))
 		return err
 	}
 	if fi, statErr := os.Stat(outPath); statErr == nil {
-		spinner.Success(fmt.Sprintf("downloaded archive (%d MB)", fi.Size()/(1024*1024)))
+		spinner.Success(fmt.Sprintf("downloaded %s (%d MB)", label, fi.Size()/(1024*1024)))
 	} else {
-		spinner.Success("downloaded archive")
+		spinner.Success(fmt.Sprintf("downloaded %s", label))
 	}
 	return nil
 }

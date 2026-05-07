@@ -52,7 +52,7 @@ running without a TTY.`,
 		lockSource, _ := cmd.Flags().GetBool("lock-source-repo")
 		noSSL, _ := cmd.Flags().GetBool("no-ssl-verify")
 
-		wd, err := workdir.New(viper.GetString("WORK_DIR"))
+		wd, err := workdir.New(resolveWorkDir(cmd))
 		if err != nil {
 			return fmt.Errorf("failed to initialize work directory: %w", err)
 		}

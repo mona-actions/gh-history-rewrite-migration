@@ -55,7 +55,7 @@ func runRewrite(cmd *cobra.Command, _ []string) error {
 		ctx = context.Background()
 	}
 
-	wd, err := workdir.New(viper.GetString("WORK_DIR"))
+	wd, err := workdir.New(resolveWorkDir(cmd))
 	if err != nil {
 		return fmt.Errorf("failed to initialize work directory: %w", err)
 	}
