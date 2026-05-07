@@ -171,9 +171,6 @@ func (i *Importer) Run(ctx context.Context) error {
 	if i.cfg.UseGitHubStorage {
 		args = append(args, "--use-github-storage")
 	}
-	if i.cfg.AzureStorageConnectionString != "" {
-		args = append(args, "--azure-storage-connection-string", i.cfg.AzureStorageConnectionString)
-	}
 	if i.cfg.AWSBucketName != "" {
 		args = append(args, "--aws-bucket-name", i.cfg.AWSBucketName)
 	}
@@ -211,7 +208,7 @@ func (i *Importer) Run(ctx context.Context) error {
 	// 6. Run gh gei. No spinner here: the child streams its own
 	// progress to stdout/stderr, and a pterm spinner on the same TTY
 	// would interleave with that output.
-	env := buildEnv(os.Environ(), sourcePAT, targetPAT)
+	env := buildEnv(os.Environ(), sourcePAT, targetPAT, i.cfg.AzureStorageConnectionString)
 	output.Info("Running gh gei migrate-repo...")
 	stderr, err := i.execer.Run(ctx, ghPath, args, env)
 	if err != nil {
@@ -226,18 +223,23 @@ func (i *Importer) Run(ctx context.Context) error {
 	return nil
 }
 
-// buildEnv returns base with GH_SOURCE_PAT / GH_PAT set (replacing any
-// existing entries with the same key) so child processes see exactly
-// one definition for each.
-func buildEnv(base []string, sourcePAT, targetPAT string) []string {
-	out := make([]string, 0, len(base)+2)
+// buildEnv returns base with GH_SOURCE_PAT / GH_PAT /
+// AZURE_STORAGE_CONNECTION_STRING set (replacing any existing entries with
+// the same keys) so child processes see exactly one definition for each.
+func buildEnv(base []string, sourcePAT, targetPAT, azureConnStr string) []string {
+	out := make([]string, 0, len(base)+3)
 	for _, kv := range base {
-		// Preserve order but drop existing PAT entries; we re-append below.
-		if strings.HasPrefix(kv, "GH_SOURCE_PAT=") || strings.HasPrefix(kv, "GH_PAT=") {
+		// Preserve order but drop managed credential entries; we re-append below.
+		if strings.HasPrefix(kv, "GH_SOURCE_PAT=") ||
+			strings.HasPrefix(kv, "GH_PAT=") ||
+			strings.HasPrefix(kv, "AZURE_STORAGE_CONNECTION_STRING=") {
 			continue
 		}
 		out = append(out, kv)
 	}
 	out = append(out, "GH_SOURCE_PAT="+sourcePAT, "GH_PAT="+targetPAT)
+	if azureConnStr != "" {
+		out = append(out, "AZURE_STORAGE_CONNECTION_STRING="+azureConnStr)
+	}
 	return out
 }

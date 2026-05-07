@@ -231,17 +231,6 @@ func (e *Exporter) runMigration(ctx context.Context, opts api.MigrationOpts, out
 	if err != nil {
 		return fmt.Errorf("failed to start migration: %w", err)
 	}
-	defer func() {
-		if ctx.Err() != nil {
-			return
-		}
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if cleanupErr := e.api.DeleteMigrationArchive(cleanupCtx, e.cfg.Org, migrationID); cleanupErr != nil {
-			output.Warn(fmt.Sprintf("failed to delete remote migration archive (best-effort): %v", cleanupErr))
-		}
-	}()
-
 	if err := e.pollUntilExported(ctx, migrationID, label); err != nil {
 		return err
 	}
@@ -251,6 +240,15 @@ func (e *Exporter) runMigration(ctx context.Context, opts api.MigrationOpts, out
 	if err := atomicfs.ValidateTarHeader(outPath); err != nil {
 		_ = os.Remove(outPath)
 		return fmt.Errorf("downloaded archive failed validation: %w", err)
+	}
+
+	// Best-effort cleanup of the remote archive now that local copy is validated.
+	if ctx.Err() == nil {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if cleanupErr := e.api.DeleteMigrationArchive(cleanupCtx, e.cfg.Org, migrationID); cleanupErr != nil {
+			output.Warn(fmt.Sprintf("failed to delete remote %s (best-effort): %v", label, cleanupErr))
+		}
 	}
 	return nil
 }

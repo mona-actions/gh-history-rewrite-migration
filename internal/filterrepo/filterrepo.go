@@ -375,6 +375,32 @@ func flagName(tok string) string {
 	return tok
 }
 
+// redactForLog joins args for logging but redacts callback bodies.
+// Any arg following a --*-callback flag, or any --*-callback=<body> arg,
+// has its body replaced with <redacted>.
+func redactForLog(args []string) string {
+	out := make([]string, 0, len(args))
+	skipNext := false
+	for _, a := range args {
+		if skipNext {
+			out = append(out, "<redacted>")
+			skipNext = false
+			continue
+		}
+		if strings.HasSuffix(a, "-callback") {
+			out = append(out, a)
+			skipNext = true
+			continue
+		}
+		if i := strings.Index(a, "-callback="); i >= 0 {
+			out = append(out, a[:i+len("-callback=")]+"<redacted>")
+			continue
+		}
+		out = append(out, a)
+	}
+	return strings.Join(out, " ")
+}
+
 // Run executes `git filter-repo <args>` from inside bareRepoPath after
 // validating args via ValidateUserFlags(args, false). It is intended for
 // standalone rewrite operations not coupled to the strip workflow.
@@ -382,8 +408,8 @@ func (r *Runner) Run(ctx context.Context, bareRepoPath string, args []string) er
 	if err := ValidateUserFlags(args, false); err != nil {
 		return err
 	}
-	full := append([]string{"filter-repo"}, args...)
-	r.info(fmt.Sprintf("running git %s", strings.Join(full, " ")))
+	full := append([]string{"filter-repo", "--force"}, args...)
+	r.info(fmt.Sprintf("running git %s", redactForLog(full)))
 	var stderr bytes.Buffer
 	if err := r.execer.Run(ctx, bareRepoPath, r.bin, full, r.stdout, &stderr); err != nil {
 		return fmt.Errorf("git filter-repo failed: %w (stderr=%q)", err, stderr.String())
@@ -424,7 +450,7 @@ func (r *Runner) RunCallbackScripts(ctx context.Context, bareRepoPath string, sc
 		return nil
 	}
 	seen := map[string]string{} // flag -> path that introduced it
-	args := []string{"filter-repo"}
+	args := []string{"filter-repo", "--force"}
 	for _, p := range scriptPaths {
 		flag, err := CallbackKindFor(p)
 		if err != nil {

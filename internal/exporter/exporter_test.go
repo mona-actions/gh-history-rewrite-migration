@@ -282,13 +282,32 @@ func TestExporterRunModeMismatchErrorsBeforeHTTP(t *testing.T) {
 	assert.Equal(t, int32(0), atomic.LoadInt32(&fake.startCalled))
 }
 
-func TestExporterRunFailedStateCleansRemote(t *testing.T) {
+func TestExporterRunFailedStateKeepsRemote(t *testing.T) {
 	fake := &fakeAPI{pollSequence: []string{"failed"}}
 	exp, _ := newTestExporter(t, fake, Config{})
 	err := exp.Run(context.Background())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed state")
-	assert.Equal(t, int32(1), atomic.LoadInt32(&fake.deleteCalled))
+	assert.Equal(t, int32(0), atomic.LoadInt32(&fake.deleteCalled))
+}
+
+func TestExporterRunMigrationDownloadErrorKeepsRemote(t *testing.T) {
+	fake := &fakeAPI{pollSequence: []string{"exported"}, downloadErr: errors.New("boom")}
+	exp, wd := newTestExporter(t, fake, Config{})
+	err := exp.runMigration(context.Background(), api.MigrationOpts{Repositories: []string{"widget"}}, wd.RawGitArchive(), "git archive")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to download git archive")
+	assert.Equal(t, int32(0), atomic.LoadInt32(&fake.deleteCalled))
+}
+
+func TestExporterRunMigrationValidationErrorKeepsRemote(t *testing.T) {
+	fake := &fakeAPI{pollSequence: []string{"exported"}, archiveBytes: [][]byte{[]byte("not a tarball")}}
+	exp, wd := newTestExporter(t, fake, Config{})
+	err := exp.runMigration(context.Background(), api.MigrationOpts{Repositories: []string{"widget"}}, wd.RawGitArchive(), "git archive")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "downloaded archive failed validation")
+	assert.Equal(t, int32(0), atomic.LoadInt32(&fake.deleteCalled))
+	assert.NoFileExists(t, wd.RawGitArchive())
 }
 
 func TestExporterRunContextCancelDoesNotCleanRemote(t *testing.T) {

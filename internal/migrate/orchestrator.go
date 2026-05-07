@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 
 	"github.com/mona-actions/gh-history-rewrite-migration/internal/atomicfs"
 	"github.com/mona-actions/gh-history-rewrite-migration/internal/remap"
@@ -198,15 +199,34 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		o.out.Info("Rewrite skipped (already complete in this work-dir).")
 	}
 
-	// Remap: idempotent — skips if metadata archive already has sentinel.
-	o.out.Info("Remapping commit SHAs in metadata...")
-	remapRes, err := o.remapper.Run(ctx, o.remapIn)
-	if err != nil {
-		return fmt.Errorf("remap phase failed (raw metadata archive %q, commit map %q): %w",
-			o.remapIn.RawMetadataArchive, o.remapIn.CommitMapPath, err)
+	// Remap: only runs if filter-repo produced a commit-map (i.e., rewrites occurred).
+	wd := o.wd
+	if wd == nil {
+		wd = o.remapIn.WorkDir
 	}
-	for _, warning := range remapRes.Warnings {
-		o.out.Warn(warning)
+	if wd != nil && wd.HasCommitMap() {
+		o.out.Info("Remapping commit SHAs in metadata...")
+		remapRes, err := o.remapper.Run(ctx, o.remapIn)
+		if err != nil {
+			return fmt.Errorf("remap phase failed (raw metadata archive %q, commit map %q): %w",
+				o.remapIn.RawMetadataArchive, o.remapIn.CommitMapPath, err)
+		}
+		for _, warning := range remapRes.Warnings {
+			o.out.Warn(warning)
+		}
+	} else {
+		o.out.Warn("no rewrites performed; using original metadata archive")
+		// Copy raw metadata archive to the expected location so importer finds it.
+		raw := o.remapIn.RawMetadataArchive
+		if wd != nil {
+			raw = wd.RawMetadataArchive()
+			final := wd.MetadataArchive()
+			if _, err := os.Stat(raw); err == nil {
+				if err := atomicfs.CopyFile(raw, final); err != nil {
+					return fmt.Errorf("failed to copy metadata archive: %w", err)
+				}
+			}
+		}
 	}
 
 	// Phase 3: import (Gate 2 lives inside the importer).

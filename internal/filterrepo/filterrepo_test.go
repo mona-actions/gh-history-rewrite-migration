@@ -165,9 +165,20 @@ func TestRunCallbackScripts_PassesBodyAndPath(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, exec.calls, 1)
 	args := exec.calls[0]
-	// Args: [git filter-repo --email-callback <body>]
+	// Args: [git filter-repo --force --email-callback <body>]
 	assert.Contains(t, args, "--email-callback")
 	assert.Contains(t, args, body)
+}
+
+func TestRedactForLog(t *testing.T) {
+	got := redactForLog([]string{"filter-repo", "--commit-callback", "some code", "--refs", "main"})
+	assert.Equal(t, "filter-repo --commit-callback <redacted> --refs main", got)
+
+	got = redactForLog([]string{"filter-repo", "--blob-callback=some code", "--refs", "main"})
+	assert.Equal(t, "filter-repo --blob-callback=<redacted> --refs main", got)
+
+	got = redactForLog([]string{"filter-repo", "--partial", "--refs", "main"})
+	assert.Equal(t, "filter-repo --partial --refs main", got)
 }
 
 func TestRun_RejectsReservedFlag(t *testing.T) {
@@ -182,7 +193,33 @@ func TestRun_PassesArgs(t *testing.T) {
 	err := r.Run(context.Background(), "/tmp", []string{"--refs", "main"})
 	require.NoError(t, err)
 	require.Len(t, exec.calls, 1)
-	assert.Equal(t, []string{"git", "filter-repo", "--refs", "main"}, exec.calls[0])
+	assert.Equal(t, []string{"git", "filter-repo", "--force", "--refs", "main"}, exec.calls[0])
+}
+
+func TestRunAndRunCallbackScripts_IncludeForce(t *testing.T) {
+	t.Run("Run", func(t *testing.T) {
+		exec := &fakeExecer{}
+		r := New(exec, nil)
+
+		err := r.Run(context.Background(), "/tmp", []string{"--refs", "main"})
+		require.NoError(t, err)
+		require.Len(t, exec.calls, 1)
+		assert.Equal(t, []string{"git", "filter-repo", "--force", "--refs", "main"}, exec.calls[0])
+	})
+
+	t.Run("RunCallbackScripts", func(t *testing.T) {
+		dir := t.TempDir()
+		script := filepath.Join(dir, "fixmail.email-callback.py")
+		require.NoError(t, os.WriteFile(script, []byte("return email"), 0o644))
+
+		exec := &fakeExecer{}
+		r := New(exec, nil)
+
+		err := r.RunCallbackScripts(context.Background(), dir, []string{script})
+		require.NoError(t, err)
+		require.Len(t, exec.calls, 1)
+		assert.Equal(t, []string{"git", "filter-repo", "--force"}, exec.calls[0][:3])
+	})
 }
 
 func TestStripPaths_Args(t *testing.T) {

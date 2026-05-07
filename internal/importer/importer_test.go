@@ -11,13 +11,13 @@ import (
 
 // stubExecer records calls and returns canned results.
 type stubExecer struct {
-	lookErr    error
-	runErr     error
-	runStderr  string
-	gotName    string
-	gotArgs    []string
-	gotEnv     []string
-	runCalled  bool
+	lookErr   error
+	runErr    error
+	runStderr string
+	gotName   string
+	gotArgs   []string
+	gotEnv    []string
+	runCalled bool
 }
 
 func (s *stubExecer) LookPath(name string) (string, error) {
@@ -231,36 +231,40 @@ func TestRun_NoTTY_RequiresConfirm(t *testing.T) {
 	}
 }
 
-func TestRun_PATsInEnvNotArgs(t *testing.T) {
+func TestRun_CredentialsInEnvNotArgs(t *testing.T) {
 	wd := newWorkDir(t, true)
 	withPATEnv(t, "secret-source-pat-xyz", "secret-target-pat-abc")
 
 	stub := &stubExecer{}
 	imp := New(wd, Config{
-		SourceOrg:      "src-org",
-		SourceRepo:     "src-repo",
-		TargetOrg:      "o",
-		TargetRepo:     "r",
-		SourceHostname: "github.com",
-		Confirm:        true,
+		SourceOrg:                    "src-org",
+		SourceRepo:                   "src-repo",
+		TargetOrg:                    "o",
+		TargetRepo:                   "r",
+		SourceHostname:               "github.com",
+		AzureStorageConnectionString: "DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=key",
+		Confirm:                      true,
 	}, stub)
 
 	if err := imp.Run(context.Background()); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
-	// Args must NOT contain the PAT tokens or the env-var names with values.
+	// Args must NOT contain credential values or managed env-var names.
 	for _, a := range stub.gotArgs {
 		if strings.Contains(a, "secret-source-pat-xyz") ||
 			strings.Contains(a, "secret-target-pat-abc") ||
+			strings.Contains(a, "DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=key") ||
 			strings.Contains(a, "GH_SOURCE_PAT") ||
-			strings.Contains(a, "GH_PAT") {
-			t.Errorf("argv leaked PAT/env name: %q (args=%v)", a, stub.gotArgs)
+			strings.Contains(a, "GH_PAT") ||
+			strings.Contains(a, "AZURE_STORAGE_CONNECTION_STRING") ||
+			a == "--azure-storage-connection-string" {
+			t.Errorf("argv leaked credential/env name: %q (args=%v)", a, stub.gotArgs)
 		}
 	}
 
-	// Env must contain both PAT entries exactly once.
-	var sawSource, sawTarget int
+	// Env must contain all credential entries exactly once.
+	var sawSource, sawTarget, sawAzure int
 	for _, kv := range stub.gotEnv {
 		if kv == "GH_SOURCE_PAT=secret-source-pat-xyz" {
 			sawSource++
@@ -268,12 +272,18 @@ func TestRun_PATsInEnvNotArgs(t *testing.T) {
 		if kv == "GH_PAT=secret-target-pat-abc" {
 			sawTarget++
 		}
+		if kv == "AZURE_STORAGE_CONNECTION_STRING=DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=key" {
+			sawAzure++
+		}
 	}
 	if sawSource != 1 {
 		t.Errorf("expected exactly one GH_SOURCE_PAT entry, got %d", sawSource)
 	}
 	if sawTarget != 1 {
 		t.Errorf("expected exactly one GH_PAT entry, got %d", sawTarget)
+	}
+	if sawAzure != 1 {
+		t.Errorf("expected exactly one AZURE_STORAGE_CONNECTION_STRING entry, got %d", sawAzure)
 	}
 }
 

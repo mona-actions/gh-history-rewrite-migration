@@ -3,11 +3,13 @@ package migrate
 import (
 	"context"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 
 	"github.com/mona-actions/gh-history-rewrite-migration/internal/remap"
 	"github.com/mona-actions/gh-history-rewrite-migration/internal/rewriter"
+	"github.com/mona-actions/gh-history-rewrite-migration/internal/workdir"
 )
 
 // --- fakes ---------------------------------------------------------------
@@ -84,14 +86,28 @@ func build(t *testing.T,
 	cfg Config,
 ) (*Orchestrator, *recorder) {
 	t.Helper()
+	wd, err := workdir.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("workdir.New: %v", err)
+	}
+	if err := os.WriteFile(wd.RawMetadataArchive(), []byte("raw metadata"), 0o644); err != nil {
+		t.Fatalf("write raw metadata: %v", err)
+	}
+	if err := os.WriteFile(wd.CommitMap(), []byte("old new\n"), 0o644); err != nil {
+		t.Fatalf("write commit-map: %v", err)
+	}
+
 	rec := &recorder{}
-	// Pass nil workdir; tests don't need on-disk artifact checks
-	// (workDirHasArtifacts returns false on nil).
 	var dr DoctorRunner
 	if d != nil {
 		dr = d
 	}
-	o := New(nil, dr, e, rw, rm, im, remap.Input{}, cfg, rec.printers())
+	cfg.Resume = true
+	o := New(wd, dr, e, rw, rm, im, remap.Input{
+		WorkDir:            wd,
+		RawMetadataArchive: wd.RawMetadataArchive(),
+		CommitMapPath:      wd.CommitMap(),
+	}, cfg, rec.printers())
 	return o, rec
 }
 
@@ -237,6 +253,47 @@ func TestRun_ImporterFails_ReturnsError(t *testing.T) {
 	// clean up artifacts on import failure so the user can re-run.
 	if !rw.called || !rm.called {
 		t.Errorf("rewrite+remap must have completed before import")
+	}
+}
+
+func TestRun_NoCommitMap_CopiesRawMetadataAndSkipsRemap(t *testing.T) {
+	wd, err := workdir.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("workdir.New: %v", err)
+	}
+	if err := os.WriteFile(wd.RawMetadataArchive(), []byte("raw metadata"), 0o644); err != nil {
+		t.Fatalf("write raw metadata: %v", err)
+	}
+
+	e := &fakeExporter{}
+	rw := &fakeRewriter{res: &rewriter.Result{}}
+	rm := &fakeRemapper{}
+	im := &fakeImporter{}
+	rec := &recorder{}
+	o := New(wd, nil, e, rw, rm, im, remap.Input{
+		WorkDir:            wd,
+		RawMetadataArchive: wd.RawMetadataArchive(),
+		CommitMapPath:      wd.CommitMap(),
+	}, Config{Resume: true}, rec.printers())
+
+	if err := o.Run(context.Background()); err != nil {
+		t.Fatalf("expected success, got %v", err)
+	}
+	if rm.called {
+		t.Fatal("remapper should not run when no commit-map exists")
+	}
+	if !im.called {
+		t.Fatal("importer should run when remap is skipped")
+	}
+	got, err := os.ReadFile(wd.MetadataArchive())
+	if err != nil {
+		t.Fatalf("read final metadata archive: %v", err)
+	}
+	if string(got) != "raw metadata" {
+		t.Fatalf("expected final metadata archive to match raw metadata, got %q", string(got))
+	}
+	if !strings.Contains(rec.joined(), "no rewrites performed; using original metadata archive") {
+		t.Fatalf("expected no-op remap warning, got %s", rec.joined())
 	}
 }
 
