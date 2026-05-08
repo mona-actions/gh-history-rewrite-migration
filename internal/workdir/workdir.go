@@ -124,19 +124,6 @@ func (w *WorkDir) HasMetadataArchive() bool {
 	return err == nil
 }
 
-// FreeSpaceGB returns the available disk space in gigabytes for the work directory.
-// Returns 0 and error on platforms that don't support statfs.
-func (w *WorkDir) FreeSpaceGB() (uint64, error) {
-	var stat syscall.Statfs_t
-	if err := syscall.Statfs(w.root, &stat); err != nil {
-		return 0, fmt.Errorf("failed to get disk space: %w", err)
-	}
-
-	// Available blocks * block size = available bytes
-	availableBytes := stat.Bavail * uint64(stat.Bsize)
-	return availableBytes / (1024 * 1024 * 1024), nil
-}
-
 // Lock creates a lock file containing this process's PID using atomic
 // O_EXCL semantics, so concurrent callers (in the same process or across
 // processes) race correctly: exactly one wins.
