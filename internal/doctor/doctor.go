@@ -300,7 +300,7 @@ func (d *Doctor) checkSourceReachable(ctx context.Context) CheckResult {
 
 func (d *Doctor) checkWorkDir() CheckResult {
 	// Use WorkDir.New for existence and writability checks
-	wd, err := workdir.New(d.workDir)
+	_, err := workdir.New(d.workDir)
 	if err != nil {
 		return CheckResult{
 			Name:    "Work directory",
@@ -309,30 +309,10 @@ func (d *Doctor) checkWorkDir() CheckResult {
 		}
 	}
 
-	// Check free space
-	availableGB, err := wd.FreeSpaceGB()
-	if err != nil {
-		// If we can't get disk space, just confirm writable
-		return CheckResult{
-			Name:    "Work directory",
-			Status:  StatusOK,
-			Message: fmt.Sprintf("%s is writable", d.workDir),
-		}
-	}
-
-	minGB := uint64(10) // Default minimum 10GB
-	if availableGB < minGB {
-		return CheckResult{
-			Name:    "Work directory",
-			Status:  StatusWarn,
-			Message: fmt.Sprintf("%s has only %dGB free (recommend >= %dGB)", d.workDir, availableGB, minGB),
-		}
-	}
-
 	return CheckResult{
 		Name:    "Work directory",
 		Status:  StatusOK,
-		Message: fmt.Sprintf("%s (%dGB free)", d.workDir, availableGB),
+		Message: fmt.Sprintf("%s is writable", d.workDir),
 	}
 }
 

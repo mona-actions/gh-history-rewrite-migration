@@ -37,8 +37,13 @@ jobs:
       - name: go vet
         run: go vet ./...
 
-      - name: Build
-        run: go build ./...
+      - name: Build (cross-compile)
+        run: |
+          # Verify the code compiles on all release targets to catch
+          # platform-specific type mismatches before they reach release.
+          for pair in linux/amd64 linux/arm64 linux/arm darwin/amd64 darwin/arm64 windows/amd64 windows/arm64 freebsd/amd64; do
+            GOOS="${pair%%/*}" GOARCH="${pair##*/}" go build ./... || exit 1
+          done
 
       # We intentionally do NOT pass -race because the upstream pterm
       # spinner library has a benign internal data race that the detector
