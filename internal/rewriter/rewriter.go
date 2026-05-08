@@ -431,7 +431,7 @@ func (r *Rewriter) handoffCommitMap(srcCommitMap string) string {
 		if err != nil {
 			return err
 		}
-		defer in.Close()
+		defer func() { _ = in.Close() }()
 		_, err = io.Copy(w, in)
 		return err
 	}); err != nil {

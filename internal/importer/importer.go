@@ -124,6 +124,30 @@ func New(wd *workdir.WorkDir, cfg Config, execer Execer) *Importer {
 //  5. Confirmation gate (Gate 2).
 //  6. Invoke gh gei, streaming output to the parent process.
 func (i *Importer) Run(ctx context.Context) error {
+	// Validate required fields before invoking gei.
+	if i.cfg.SourceOrg == "" {
+		return fmt.Errorf("importer: --org (source organization) is required")
+	}
+	if i.cfg.SourceRepo == "" {
+		return fmt.Errorf("importer: --repo (source repository) is required")
+	}
+	if i.cfg.TargetOrg == "" {
+		return fmt.Errorf("importer: --target-org is required")
+	}
+	if i.cfg.TargetRepo == "" {
+		return fmt.Errorf("importer: --target-repo is required")
+	}
+	if i.cfg.TargetRepoVisibility != "" {
+		switch i.cfg.TargetRepoVisibility {
+		case "public", "private", "internal":
+			// Valid visibility values
+		default:
+			return fmt.Errorf("importer: --target-repo-visibility must be one of: public, private, internal (got %q)", i.cfg.TargetRepoVisibility)
+		}
+	} else {
+		i.cfg.TargetRepoVisibility = "private"
+	}
+
 	// 1. Verify archives.
 	if !i.wd.HasGitArchive() {
 		return fmt.Errorf("git archive not found at %s; run rewrite first", i.wd.GitArchive())

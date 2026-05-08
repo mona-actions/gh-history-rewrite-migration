@@ -1,3 +1,4 @@
+// Package output provides structured console output helpers (tables, summaries).
 package output
 
 import (
@@ -110,7 +111,7 @@ func Table(headers []string, rows [][]string) {
 
 	tableData := pterm.TableData{headers}
 	tableData = append(tableData, rows...)
-	pterm.DefaultTable.WithHasHeader().WithData(tableData).Render()
+	_ = pterm.DefaultTable.WithHasHeader().WithData(tableData).Render()
 }
 
 // IsTerminal returns true if stdout is connected to a terminal (interactive mode).

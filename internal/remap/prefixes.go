@@ -25,5 +25,4 @@ var KnownNonSHAPrefixes = []string{
 	"repositories",
 	"users",
 	"attachments",
-	"schema", // schema.json — not numbered, but matches *_*.json regex if interpreted loosely; included for completeness
 }

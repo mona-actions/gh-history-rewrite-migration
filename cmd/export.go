@@ -31,11 +31,11 @@ func init() {
 	exportCmd.Flags().Bool("lock-repositories", false, "Lock source repositories during migration")
 	exportCmd.Flags().String("export-mode", "two", "Export mode: two or combined")
 
-	viper.BindPFlag("EXCLUDE_RELEASES", exportCmd.Flags().Lookup("exclude-releases"))
-	viper.BindPFlag("EXCLUDE_METADATA", exportCmd.Flags().Lookup("exclude-metadata"))
-	viper.BindPFlag("EXCLUDE_ATTACHMENTS", exportCmd.Flags().Lookup("exclude-attachments"))
-	viper.BindPFlag("LOCK_REPOSITORIES", exportCmd.Flags().Lookup("lock-repositories"))
-	viper.BindPFlag("EXPORT_MODE", exportCmd.Flags().Lookup("export-mode"))
+	_ = viper.BindPFlag("EXCLUDE_RELEASES", exportCmd.Flags().Lookup("exclude-releases"))
+	_ = viper.BindPFlag("EXCLUDE_METADATA", exportCmd.Flags().Lookup("exclude-metadata"))
+	_ = viper.BindPFlag("EXCLUDE_ATTACHMENTS", exportCmd.Flags().Lookup("exclude-attachments"))
+	_ = viper.BindPFlag("LOCK_REPOSITORIES", exportCmd.Flags().Lookup("lock-repositories"))
+	_ = viper.BindPFlag("EXPORT_MODE", exportCmd.Flags().Lookup("export-mode"))
 
 	rootCmd.AddCommand(exportCmd)
 }

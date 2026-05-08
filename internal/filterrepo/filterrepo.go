@@ -254,7 +254,7 @@ func parseSizesFile(path string, keepMax bool) (map[string]int64, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	out := map[string]int64{}
 	scanner := bufio.NewScanner(f)
@@ -498,7 +498,7 @@ func CountCommitsRemapped(commitMapPath string) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("filterrepo: open commit-map: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	count := 0
 	scanner := bufio.NewScanner(f)

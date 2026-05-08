@@ -54,7 +54,7 @@ func TestStartOrgMigration(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "POST" && strings.Contains(r.URL.Path, "/migrations") {
 			w.WriteHeader(http.StatusCreated)
-			w.Write([]byte(fmt.Sprintf(`{"id": %d, "state": "pending"}`, migrationID)))
+			fmt.Fprintf(w, `{"id": %d, "state": "pending"}`, migrationID)
 			return
 		}
 		w.WriteHeader(http.StatusNotFound)

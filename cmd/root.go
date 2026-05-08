@@ -45,13 +45,13 @@ func init() {
 
 	// Bind flags to Viper
 	// Priority: Flag value > Environment variable > Default value
-	viper.BindPFlag("WORK_DIR", rootCmd.PersistentFlags().Lookup("work-dir"))
-	viper.BindPFlag("ORG", rootCmd.PersistentFlags().Lookup("org"))
-	viper.BindPFlag("REPO", rootCmd.PersistentFlags().Lookup("repo"))
-	viper.BindPFlag("TARGET_ORG", rootCmd.PersistentFlags().Lookup("target-org"))
-	viper.BindPFlag("SOURCE_HOSTNAME", rootCmd.PersistentFlags().Lookup("source-hostname"))
-	viper.BindPFlag("LARGE_FILE_THRESHOLD", rootCmd.PersistentFlags().Lookup("large-file-threshold"))
-	viper.BindPFlag("NO_COLOR", rootCmd.PersistentFlags().Lookup("no-color"))
+	_ = viper.BindPFlag("WORK_DIR", rootCmd.PersistentFlags().Lookup("work-dir"))
+	_ = viper.BindPFlag("ORG", rootCmd.PersistentFlags().Lookup("org"))
+	_ = viper.BindPFlag("REPO", rootCmd.PersistentFlags().Lookup("repo"))
+	_ = viper.BindPFlag("TARGET_ORG", rootCmd.PersistentFlags().Lookup("target-org"))
+	_ = viper.BindPFlag("SOURCE_HOSTNAME", rootCmd.PersistentFlags().Lookup("source-hostname"))
+	_ = viper.BindPFlag("LARGE_FILE_THRESHOLD", rootCmd.PersistentFlags().Lookup("large-file-threshold"))
+	_ = viper.BindPFlag("NO_COLOR", rootCmd.PersistentFlags().Lookup("no-color"))
 
 	// Set default values
 	viper.SetDefault("WORK_DIR", "./work")
@@ -60,8 +60,8 @@ func init() {
 	viper.SetDefault("EXPORT_MODE", "two")
 
 	// Bind environment variables explicitly for PAT authentication
-	viper.BindEnv("GH_SOURCE_PAT")
-	viper.BindEnv("GH_PAT")
+	_ = viper.BindEnv("GH_SOURCE_PAT")
+	_ = viper.BindEnv("GH_PAT")
 }
 
 // checkRequiredVars validates that all required configuration values are set

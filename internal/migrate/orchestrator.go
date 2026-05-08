@@ -217,14 +217,14 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 	} else {
 		o.out.Warn("no rewrites performed; using original metadata archive")
 		// Copy raw metadata archive to the expected location so importer finds it.
-		raw := o.remapIn.RawMetadataArchive
 		if wd != nil {
-			raw = wd.RawMetadataArchive()
+			raw := wd.RawMetadataArchive()
 			final := wd.MetadataArchive()
-			if _, err := os.Stat(raw); err == nil {
-				if err := atomicfs.CopyFile(raw, final); err != nil {
-					return fmt.Errorf("failed to copy metadata archive: %w", err)
-				}
+			if _, err := os.Stat(raw); err != nil {
+				return fmt.Errorf("raw metadata archive not found at %s: %w (re-run export)", raw, err)
+			}
+			if err := atomicfs.CopyFile(raw, final); err != nil {
+				return fmt.Errorf("failed to copy metadata archive: %w", err)
 			}
 		}
 	}

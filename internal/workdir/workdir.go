@@ -1,3 +1,4 @@
+// Package workdir manages the on-disk directory layout for a single migration.
 package workdir
 
 import (
@@ -30,7 +31,7 @@ func New(root string) (*WorkDir, error) {
 	if err := os.WriteFile(testFile, []byte("test"), 0644); err != nil {
 		return nil, fmt.Errorf("work directory is not writable: %w", err)
 	}
-	os.Remove(testFile)
+	_ = os.Remove(testFile)
 
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
@@ -154,7 +155,7 @@ func (w *WorkDir) Lock() error {
 			}
 			return false, fmt.Errorf("failed to create lock file: %w", err)
 		}
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 		_, err = fmt.Fprintf(f, "%d\n", os.Getpid())
 		if err != nil {
 			// Don't leave an empty .lock behind — future callers would

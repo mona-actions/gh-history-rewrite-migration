@@ -1,3 +1,4 @@
+// Package api provides authenticated GitHub API clients for both GHES and GHEC.
 package api
 
 import (
@@ -134,15 +135,15 @@ func New(ctx context.Context, hostname, token string) (*API, error) {
 func (a *API) Reachable(ctx context.Context) error {
 	if a.hostname == "github.com" {
 		// Use Zen endpoint for github.com
-		_, _, err := a.client.Zen(ctx)
+		_, _, err := a.client.Meta.Zen(ctx)
 		if err != nil {
 			return fmt.Errorf("failed to reach GitHub API: %w", err)
 		}
 		return nil
 	}
 
-	// For GHES, use APIMeta endpoint
-	_, _, err := a.client.APIMeta(ctx)
+	// For GHES, use meta endpoint
+	_, _, err := a.client.Meta.Get(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to reach GitHub Enterprise API at %s: %w", a.hostname, err)
 	}
@@ -215,7 +216,7 @@ func (a *API) DownloadArchive(ctx context.Context, org string, id int64, dest st
 	if err != nil {
 		return fmt.Errorf("failed to download archive: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
@@ -226,7 +227,7 @@ func (a *API) DownloadArchive(ctx context.Context, org string, id int64, dest st
 	if err != nil {
 		return fmt.Errorf("failed to create destination file: %w", err)
 	}
-	defer out.Close()
+	defer func() { _ = out.Close() }()
 
 	// Stream to disk
 	_, err = io.Copy(out, resp.Body)

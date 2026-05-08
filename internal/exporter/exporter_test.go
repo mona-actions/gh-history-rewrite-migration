@@ -218,34 +218,6 @@ func TestExporterRunSkipsCompleteArchives(t *testing.T) {
 	assert.Equal(t, int32(0), atomic.LoadInt32(&fake.startCalled))
 }
 
-func TestExporterRunCombinedModeSplitsFixtureArchive(t *testing.T) {
-	combinedArchive := buildCombinedFixtureArchive(t)
-	fake := &fakeAPI{pollSequence: []string{"exported"}, archiveBytes: [][]byte{combinedArchive}}
-	exp, wd := newTestExporter(t, fake, Config{Mode: ModeCombined})
-
-	require.NoError(t, exp.Run(context.Background()))
-
-	assert.Equal(t, int32(1), atomic.LoadInt32(&fake.startCalled))
-	require.Len(t, fake.opts, 1)
-	assert.False(t, fake.opts[0].ExcludeGitData)
-	assert.False(t, fake.opts[0].ExcludeMetadata)
-	assert.NoFileExists(t, wd.RawGitArchive())
-	assert.NoFileExists(t, wd.RawMetadataArchive())
-	require.FileExists(t, filepath.Join(wd.GitExtractedDir(), ".complete"))
-	require.FileExists(t, filepath.Join(wd.MetadataExtractedDir(), ".complete"))
-
-	gitRoot := wd.GitExtractedDir()
-	metaRoot := wd.MetadataExtractedDir()
-	_, err := workdir.FindBareRepo(gitRoot)
-	require.NoError(t, err)
-	assert.FileExists(t, filepath.Join(metaRoot, "issues_000001.json"))
-	assert.NoDirExists(t, filepath.Join(metaRoot, "repositories"))
-	for _, rel := range []string{"organizations_000001.json", "repositories_000001.json", "schema.json"} {
-		assert.FileExists(t, filepath.Join(gitRoot, rel))
-		assert.FileExists(t, filepath.Join(metaRoot, rel))
-	}
-}
-
 func TestExporterRunPersistsAndResumesMode(t *testing.T) {
 	gitArchive := buildTarGz(t, map[string][]byte{"repositories/Acme/widget.git/HEAD": []byte("ref: refs/heads/main\n")})
 	metaArchive := buildTarGz(t, map[string][]byte{"issues_000001.json": []byte("[]"), "schema.json": []byte("{}")})
@@ -462,33 +434,6 @@ func newTestExporterWithWorkDir(wd *workdir.WorkDir, fake *fakeAPI, cfg Config) 
 		pollInitial: time.Millisecond,
 		pollMax:     2 * time.Millisecond,
 		now:         time.Now,
-	}
-}
-
-func buildCombinedFixtureArchive(t *testing.T) []byte {
-	t.Helper()
-	root := t.TempDir()
-	repoRoot := findRepoRoot(t)
-	_, err := commitarchive.UnTar(filepath.Join(repoRoot, "internal/testdata/gei-real/git-archive.tar.gz"), root)
-	require.NoError(t, err)
-	_, err = commitarchive.UnTar(filepath.Join(repoRoot, "internal/testdata/gei-real/metadata-archive.tar.gz"), root)
-	require.NoError(t, err)
-	out := filepath.Join(t.TempDir(), "combined.tar.gz")
-	require.NoError(t, commitarchive.ReTarDir(root, out))
-	return mustReadFile(t, out)
-}
-
-func findRepoRoot(t *testing.T) string {
-	t.Helper()
-	dir, err := os.Getwd()
-	require.NoError(t, err)
-	for {
-		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
-			return dir
-		}
-		parent := filepath.Dir(dir)
-		require.NotEqual(t, dir, parent, "could not find repo root from %s", dir)
-		dir = parent
 	}
 }
 

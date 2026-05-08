@@ -71,7 +71,7 @@ func init() {
 	migrateCmd.Flags().Bool("exclude-attachments", false, "Exclude issue/PR attachments from the archive")
 	migrateCmd.Flags().Bool("lock-repositories", false, "Lock source repositories during migration")
 	migrateCmd.Flags().String("export-mode", "two", "Export mode: two or combined")
-	viper.BindPFlag("EXPORT_MODE", migrateCmd.Flags().Lookup("export-mode"))
+	_ = viper.BindPFlag("EXPORT_MODE", migrateCmd.Flags().Lookup("export-mode"))
 
 	// Phase: rewrite.
 	migrateCmd.Flags().Bool("strip-large-files", false, "Analyze the repo and strip files exceeding --large-file-threshold")

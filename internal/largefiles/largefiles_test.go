@@ -1,6 +1,7 @@
 package largefiles
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -142,6 +143,6 @@ func TestWriteCleanupFile_NilReport(t *testing.T) {
 
 func TestAnalyze_RejectsNonPositiveThreshold(t *testing.T) {
 	a := &Analyzer{threshold: 0}
-	_, err := a.Analyze(nil, "/tmp")
+	_, err := a.Analyze(context.TODO(), "/tmp")
 	require.Error(t, err)
 }

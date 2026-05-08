@@ -2,8 +2,6 @@
 
 > An end-to-end orchestrator for GitHub repo migrations that need git history rewritten before import — large-file removal, callback-based rewrites, or both.
 
-> **Status: v2 — single-repo migrations.** The default export path uses two GitHub migration API calls so the local archives match the format `gh gei migrate-repo` expects. SHA remapping is automatic: `gh-commit-remap` rewrites commit references in metadata JSONs before import.
-
 `gh-history-rewrite-migration` wraps the `export → rewrite → remap → import` pipeline behind a single `migrate` command, with two interactive confirmation gates protecting the destructive operations. Under the hood it talks to the GitHub Migrations REST API, drives `git filter-repo`, remaps metadata with `gh-commit-remap`, and imports the rewritten local archives into the target organization via `gh gei migrate-repo`.
 
 ---
@@ -45,7 +43,7 @@ gh history-rewrite-migration doctor
 
 ## Quick start
 
-Migrate `acme/legacy-monorepo` from `github.com` into `acme-cloud` on GHEC, stripping any file paths whose blobs exceed 400 MB along the way:
+Migrate `acme/legacy-monorepo` from `GHEC` into `acme-cloud` on GHEC-EMU, stripping any file paths whose blobs exceed 400 MB along the way:
 
 ```bash
 export GH_SOURCE_PAT=ghp_xxx_source
@@ -94,6 +92,31 @@ The end-to-end flow is:
 2. **Rewrite** the extracted bare repository with `git filter-repo` and copy its `commit-map` into the work directory.
 3. **Remap** metadata JSON files with `gh-commit-remap`, replacing old commit SHAs with rewritten SHAs from the `commit-map`.
 4. **Import** the final `git_archive.tar.gz` and `metadata_archive.tar.gz` with `gh gei migrate-repo --git-archive-path ... --metadata-archive-path ...`.
+
+---
+
+## Project structure
+
+```text
+.
+├── cmd/                    # Cobra command definitions (root, export, rewrite, import, migrate, doctor)
+├── internal/
+│   ├── api/               # Authenticated GitHub API clients for GHES and GHEC
+│   ├── atomicfs/          # Crash-safe file ops (write-tmp-then-rename) and sentinel tracking
+│   ├── doctor/            # Preflight checks for tool dependencies and connectivity
+│   ├── exporter/          # Orchestrates the export phase via the Migrations REST API
+│   ├── filterrepo/        # Wraps the git filter-repo external tool
+│   ├── importer/          # Wraps gh gei migrate-repo for archive import
+│   ├── largefiles/        # Analyze → flag → cleanup workflow for oversized blobs
+│   ├── migrate/           # End-to-end orchestrator (export → rewrite → remap → import)
+│   ├── output/            # Structured console output helpers (tables, summaries)
+│   ├── remap/             # Rewrites commit SHA references in metadata JSONs
+│   ├── rewriter/          # Orchestrates the history-rewrite phase
+│   └── workdir/           # Manages on-disk directory layout for a single migration
+├── docs/                   # Extended documentation (large-files, callbacks, verification)
+├── examples/               # Runnable callback script examples
+└── main.go                 # Entry point
+```
 
 ---
 

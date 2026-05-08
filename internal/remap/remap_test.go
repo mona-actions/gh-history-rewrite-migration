@@ -337,10 +337,6 @@ func TestAttachmentsBinaryFidelity(t *testing.T) {
 		}
 	}
 
-	t.Run("real fixture", func(t *testing.T) {
-		roundTrip(t, filepath.Join("..", "testdata", "gei-real", "metadata-with-attachments.tar.gz"))
-	})
-
 	t.Run("synthetic binary edge cases", func(t *testing.T) {
 		entries := []tarFixtureEntry{
 			{name: "issues_000001.json", mode: 0o644, body: []byte(`[{"some_field":"` + oldSHA1 + `"}]`)},

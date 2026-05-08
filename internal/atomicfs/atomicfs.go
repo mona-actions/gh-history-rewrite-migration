@@ -1,3 +1,5 @@
+// Package atomicfs provides crash-safe file operations using write-tmp-then-rename
+// and sentinel-based completion tracking.
 package atomicfs
 
 import (
@@ -24,7 +26,7 @@ func WriteFileAtomic(path string, write func(io.Writer) error) (err error) {
 		if err != nil {
 			return err
 		}
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 		if err := write(f); err != nil {
 			return err
 		}
@@ -95,7 +97,7 @@ func CopyFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	defer in.Close()
+	defer func() { _ = in.Close() }()
 
 	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode().Perm())
 	if err != nil {
@@ -214,7 +216,7 @@ func ValidateTarHeader(path string) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	var r io.Reader = f
 	var gz *gzip.Reader
@@ -223,7 +225,7 @@ func ValidateTarHeader(path string) error {
 		if err != nil {
 			return err
 		}
-		defer gz.Close()
+		defer func() { _ = gz.Close() }()
 		r = gz
 	}
 
