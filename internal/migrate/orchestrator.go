@@ -14,7 +14,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 
+	"github.com/mona-actions/gh-history-rewrite-migration/internal/atomicfs"
 	"github.com/mona-actions/gh-history-rewrite-migration/internal/remap"
 	"github.com/mona-actions/gh-history-rewrite-migration/internal/rewriter"
 	"github.com/mona-actions/gh-history-rewrite-migration/internal/workdir"
@@ -36,13 +38,8 @@ type ExporterRunner interface {
 // orchestrator. *rewriter.Rewriter satisfies this directly. A nil
 // Result with a nil error indicates an idempotent skip.
 type RewriterRunner interface {
-	Run(ctx context.Context) (*rewriter.Result, error)
+	Run(ctx context.Context, inputs ...rewriter.Input) (*rewriter.Result, error)
 }
-
-// Remapper is re-exported here as a type alias so callers and tests can
-// program against migrate.Remapper without importing the remap package
-// directly. It is exactly remap.Remapper.
-type Remapper = remap.Remapper
 
 // ImporterRunner is the minimal import-phase surface used by the
 // orchestrator. *importer.Importer satisfies this directly.
@@ -81,8 +78,8 @@ type Config struct {
 	// orchestrator aborts before any phase runs so users don't
 	// accidentally clobber or fork a half-finished migration.
 	// When true, the orchestrator proceeds and relies on each
-	// phase's internal idempotency (workdir.HasArchive(),
-	// HasCommitMap(), etc.) to skip already-completed work.
+	// phase's internal idempotency (raw archives, commit map,
+	// final archives, etc.) to skip already-completed work.
 	Resume bool
 }
 
@@ -93,7 +90,7 @@ type Orchestrator struct {
 	doctor   DoctorRunner
 	exporter ExporterRunner
 	rewriter RewriterRunner
-	remapper Remapper
+	remapper remap.Remapper
 	importer ImporterRunner
 
 	cfg     Config
@@ -113,7 +110,7 @@ func New(
 	doctor DoctorRunner,
 	exporter ExporterRunner,
 	rw RewriterRunner,
-	remapper Remapper,
+	remapper remap.Remapper,
 	importer ImporterRunner,
 	remapIn remap.Input,
 	cfg Config,
@@ -182,13 +179,13 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 	}
 
 	// Phase 1: export.
-	o.out.Info("Phase 1/4: Exporting source repository archive...")
+	o.out.Info("Phase 1/3: Exporting source repository archive...")
 	if err := o.exporter.Run(ctx); err != nil {
 		return fmt.Errorf("export phase failed: %w", err)
 	}
 
-	// Phase 2: rewrite (Gate 1 lives inside the rewriter).
-	o.out.Info("Phase 2/4: Rewriting history (filter-repo)...")
+	// Phase 2: rewrite + remap (Gate 1 lives inside the rewriter).
+	o.out.Info("Phase 2/3: Rewriting history (filter-repo) and remapping metadata SHAs...")
 	res, err := o.rewriter.Run(ctx)
 	if err != nil {
 		return fmt.Errorf("rewrite phase failed: %w", err)
@@ -202,24 +199,38 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		o.out.Info("Rewrite skipped (already complete in this work-dir).")
 	}
 
-	// Phase 3: remap. The stub always returns ErrUpstreamPending;
-	// the real implementation lands when gh-commit-remap publishes
-	// pkg/. Either way, an error here is fatal — partial migration
-	// is worse than no migration.
-	o.out.Info("Phase 3/4: Remapping commit SHAs in metadata...")
-	if _, err := o.remapper.Run(ctx, o.remapIn); err != nil {
-		if errors.Is(err, remap.ErrUpstreamPending) {
-			o.out.Warn(
-				"Remap step is pending upstream gh-commit-remap release. " +
-					"To finish manually: see docs/MANUAL-REMAP.md (TBD). " +
-					"Aborting before import — partial migration is worse than no migration.")
-			return err
+	// Remap: only runs if filter-repo produced a commit-map (i.e., rewrites occurred).
+	wd := o.wd
+	if wd == nil {
+		wd = o.remapIn.WorkDir
+	}
+	if wd != nil && wd.HasCommitMap() {
+		o.out.Info("Remapping commit SHAs in metadata...")
+		remapRes, err := o.remapper.Run(ctx, o.remapIn)
+		if err != nil {
+			return fmt.Errorf("remap phase failed (raw metadata archive %q, commit map %q): %w",
+				o.remapIn.RawMetadataArchive, o.remapIn.CommitMapPath, err)
 		}
-		return fmt.Errorf("remap phase failed: %w", err)
+		for _, warning := range remapRes.Warnings {
+			o.out.Warn(warning)
+		}
+	} else {
+		o.out.Warn("no rewrites performed; using original metadata archive")
+		// Copy raw metadata archive to the expected location so importer finds it.
+		if wd != nil {
+			raw := wd.RawMetadataArchive()
+			final := wd.MetadataArchive()
+			if _, err := os.Stat(raw); err != nil {
+				return fmt.Errorf("raw metadata archive not found at %s: %w (re-run export)", raw, err)
+			}
+			if err := atomicfs.CopyFile(raw, final); err != nil {
+				return fmt.Errorf("failed to copy metadata archive: %w", err)
+			}
+		}
 	}
 
-	// Phase 4: import (Gate 2 lives inside the importer).
-	o.out.Info("Phase 4/4: Importing into target organization...")
+	// Phase 3: import (Gate 2 lives inside the importer).
+	o.out.Info("Phase 3/3: Importing into target organization...")
 	if err := o.importer.Run(ctx); err != nil {
 		return fmt.Errorf("import phase failed: %w", err)
 	}
@@ -240,7 +251,8 @@ func (o *Orchestrator) workDirHasArtifacts() bool {
 	if o.wd == nil {
 		return false
 	}
-	return o.wd.HasArchive() ||
+	return atomicfs.IsFileComplete(o.wd.RawGitArchive()) ||
+		atomicfs.IsFileComplete(o.wd.RawMetadataArchive()) ||
 		o.wd.HasCommitMap() ||
 		o.wd.HasGitArchive() ||
 		o.wd.HasMetadataArchive()

@@ -13,6 +13,7 @@ import (
 type stubExecer struct {
 	lookErr   error
 	runErr    error
+	runStderr string
 	gotName   string
 	gotArgs   []string
 	gotEnv    []string
@@ -26,12 +27,12 @@ func (s *stubExecer) LookPath(name string) (string, error) {
 	return "/usr/bin/" + name, nil
 }
 
-func (s *stubExecer) Run(ctx context.Context, name string, args []string, env []string) error {
+func (s *stubExecer) Run(ctx context.Context, name string, args []string, env []string) (string, error) {
 	s.runCalled = true
 	s.gotName = name
 	s.gotArgs = args
 	s.gotEnv = env
-	return s.runErr
+	return s.runStderr, s.runErr
 }
 
 // newWorkDir returns a *workdir.WorkDir with both archives written so the
@@ -106,6 +107,8 @@ func TestRun_HappyPath_GitHubCom(t *testing.T) {
 
 	stub := &stubExecer{}
 	imp := New(wd, Config{
+		SourceOrg:      "src-org",
+		SourceRepo:     "src-repo",
 		TargetOrg:      "dest-org",
 		TargetRepo:     "dest-repo",
 		SourceHostname: "github.com",
@@ -123,6 +126,8 @@ func TestRun_HappyPath_GitHubCom(t *testing.T) {
 	}
 	wantPairs := [][]string{
 		{"gei", "migrate-repo"},
+		{"--github-source-org", "src-org"},
+		{"--source-repo", "src-repo"},
 		{"--github-target-org", "dest-org"},
 		{"--target-repo", "dest-repo"},
 		{"--git-archive-path", wd.GitArchive()},
@@ -146,6 +151,8 @@ func TestRun_GHESSource_AddsAPIURL(t *testing.T) {
 
 	stub := &stubExecer{}
 	imp := New(wd, Config{
+		SourceOrg:      "src-org",
+		SourceRepo:     "src-repo",
 		TargetOrg:      "dest-org",
 		TargetRepo:     "dest-repo",
 		SourceHostname: "ghes.example.com",
@@ -167,7 +174,7 @@ func TestRun_MissingArchives(t *testing.T) {
 		wd := newWorkDir(t, false)
 		// Only write metadata.
 		os.WriteFile(wd.MetadataArchive(), []byte("m"), 0644)
-		imp := New(wd, Config{TargetOrg: "o", TargetRepo: "r", Confirm: true}, &stubExecer{})
+		imp := New(wd, Config{SourceOrg: "src-org", SourceRepo: "src-repo", TargetOrg: "o", TargetRepo: "r", Confirm: true}, &stubExecer{})
 		err := imp.Run(context.Background())
 		if err == nil || !strings.Contains(err.Error(), "git archive not found") {
 			t.Fatalf("expected git archive error, got %v", err)
@@ -177,7 +184,7 @@ func TestRun_MissingArchives(t *testing.T) {
 	t.Run("no metadata archive", func(t *testing.T) {
 		wd := newWorkDir(t, false)
 		os.WriteFile(wd.GitArchive(), []byte("g"), 0644)
-		imp := New(wd, Config{TargetOrg: "o", TargetRepo: "r", Confirm: true}, &stubExecer{})
+		imp := New(wd, Config{SourceOrg: "src-org", SourceRepo: "src-repo", TargetOrg: "o", TargetRepo: "r", Confirm: true}, &stubExecer{})
 		err := imp.Run(context.Background())
 		if err == nil || !strings.Contains(err.Error(), "metadata archive not found") {
 			t.Fatalf("expected metadata archive error, got %v", err)
@@ -190,7 +197,7 @@ func TestRun_MissingPATs(t *testing.T) {
 
 	t.Run("missing GH_SOURCE_PAT", func(t *testing.T) {
 		withPATEnv(t, "", "tgt")
-		imp := New(wd, Config{TargetOrg: "o", TargetRepo: "r", Confirm: true}, &stubExecer{})
+		imp := New(wd, Config{SourceOrg: "src-org", SourceRepo: "src-repo", TargetOrg: "o", TargetRepo: "r", Confirm: true}, &stubExecer{})
 		err := imp.Run(context.Background())
 		if err == nil || !strings.Contains(err.Error(), "GH_SOURCE_PAT") {
 			t.Fatalf("expected GH_SOURCE_PAT error, got %v", err)
@@ -199,7 +206,7 @@ func TestRun_MissingPATs(t *testing.T) {
 
 	t.Run("missing GH_PAT", func(t *testing.T) {
 		withPATEnv(t, "src", "")
-		imp := New(wd, Config{TargetOrg: "o", TargetRepo: "r", Confirm: true}, &stubExecer{})
+		imp := New(wd, Config{SourceOrg: "src-org", SourceRepo: "src-repo", TargetOrg: "o", TargetRepo: "r", Confirm: true}, &stubExecer{})
 		err := imp.Run(context.Background())
 		if err == nil || !strings.Contains(err.Error(), "GH_PAT") {
 			t.Fatalf("expected GH_PAT error, got %v", err)
@@ -212,6 +219,8 @@ func TestRun_NoTTY_RequiresConfirm(t *testing.T) {
 	wd := newWorkDir(t, true)
 	withPATEnv(t, "src", "tgt")
 	imp := New(wd, Config{
+		SourceOrg:  "src-org",
+		SourceRepo: "src-repo",
 		TargetOrg:  "o",
 		TargetRepo: "r",
 		Confirm:    false,
@@ -222,34 +231,40 @@ func TestRun_NoTTY_RequiresConfirm(t *testing.T) {
 	}
 }
 
-func TestRun_PATsInEnvNotArgs(t *testing.T) {
+func TestRun_CredentialsInEnvNotArgs(t *testing.T) {
 	wd := newWorkDir(t, true)
 	withPATEnv(t, "secret-source-pat-xyz", "secret-target-pat-abc")
 
 	stub := &stubExecer{}
 	imp := New(wd, Config{
-		TargetOrg:      "o",
-		TargetRepo:     "r",
-		SourceHostname: "github.com",
-		Confirm:        true,
+		SourceOrg:                    "src-org",
+		SourceRepo:                   "src-repo",
+		TargetOrg:                    "o",
+		TargetRepo:                   "r",
+		SourceHostname:               "github.com",
+		AzureStorageConnectionString: "DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=key",
+		Confirm:                      true,
 	}, stub)
 
 	if err := imp.Run(context.Background()); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
-	// Args must NOT contain the PAT tokens or the env-var names with values.
+	// Args must NOT contain credential values or managed env-var names.
 	for _, a := range stub.gotArgs {
 		if strings.Contains(a, "secret-source-pat-xyz") ||
 			strings.Contains(a, "secret-target-pat-abc") ||
+			strings.Contains(a, "DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=key") ||
 			strings.Contains(a, "GH_SOURCE_PAT") ||
-			strings.Contains(a, "GH_PAT") {
-			t.Errorf("argv leaked PAT/env name: %q (args=%v)", a, stub.gotArgs)
+			strings.Contains(a, "GH_PAT") ||
+			strings.Contains(a, "AZURE_STORAGE_CONNECTION_STRING") ||
+			a == "--azure-storage-connection-string" {
+			t.Errorf("argv leaked credential/env name: %q (args=%v)", a, stub.gotArgs)
 		}
 	}
 
-	// Env must contain both PAT entries exactly once.
-	var sawSource, sawTarget int
+	// Env must contain all credential entries exactly once.
+	var sawSource, sawTarget, sawAzure int
 	for _, kv := range stub.gotEnv {
 		if kv == "GH_SOURCE_PAT=secret-source-pat-xyz" {
 			sawSource++
@@ -257,11 +272,37 @@ func TestRun_PATsInEnvNotArgs(t *testing.T) {
 		if kv == "GH_PAT=secret-target-pat-abc" {
 			sawTarget++
 		}
+		if kv == "AZURE_STORAGE_CONNECTION_STRING=DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=key" {
+			sawAzure++
+		}
 	}
 	if sawSource != 1 {
 		t.Errorf("expected exactly one GH_SOURCE_PAT entry, got %d", sawSource)
 	}
 	if sawTarget != 1 {
 		t.Errorf("expected exactly one GH_PAT entry, got %d", sawTarget)
+	}
+	if sawAzure != 1 {
+		t.Errorf("expected exactly one AZURE_STORAGE_CONNECTION_STRING entry, got %d", sawAzure)
+	}
+}
+
+func TestRun_StderrErrorDetection(t *testing.T) {
+	wd := newWorkDir(t, true)
+	withPATEnv(t, "src", "tgt")
+
+	// gei exits 0 but prints validation errors to stderr.
+	stub := &stubExecer{runStderr: "Option '--github-source-org' is required.\n"}
+	imp := New(wd, Config{
+		SourceOrg:  "src-org",
+		SourceRepo: "src-repo",
+		TargetOrg:  "o",
+		TargetRepo: "r",
+		Confirm:    true,
+	}, stub)
+
+	err := imp.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "reported errors") {
+		t.Fatalf("expected stderr-detected error, got %v", err)
 	}
 }

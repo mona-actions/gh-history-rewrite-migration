@@ -29,7 +29,7 @@ Checks include:
 
 		// Build configuration from viper/env
 		cfg := doctor.Config{
-			WorkDir:        viper.GetString("WORK_DIR"),
+			WorkDir:        resolveWorkDir(cmd),
 			SourceHostname: viper.GetString("SOURCE_HOSTNAME"),
 			SourceToken:    os.Getenv("GH_SOURCE_PAT"),
 			TargetToken:    os.Getenv("GH_PAT"),

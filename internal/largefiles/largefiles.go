@@ -20,27 +20,19 @@ import (
 	"strings"
 
 	"github.com/mona-actions/gh-history-rewrite-migration/internal/filterrepo"
+	"github.com/mona-actions/gh-history-rewrite-migration/internal/output"
 )
-
-// Logger is the minimal logging surface this package needs. Defined here
-// (rather than imported) so largefiles does not couple to filterrepo for
-// an unrelated concern. A nil logger is safe.
-type Logger interface {
-	Info(msg string)
-	Warn(msg string)
-	Error(msg string)
-}
 
 // Analyzer flags paths whose history-wide footprint exceeds a byte threshold.
 type Analyzer struct {
 	runner    *filterrepo.Runner
-	log       Logger
+	log       output.Logger
 	threshold int64
 }
 
 // New constructs an Analyzer. thresholdBytes must be > 0 (see
 // ParseThreshold for parsing user-supplied size strings).
-func New(runner *filterrepo.Runner, log Logger, thresholdBytes int64) *Analyzer {
+func New(runner *filterrepo.Runner, log output.Logger, thresholdBytes int64) *Analyzer {
 	return &Analyzer{runner: runner, log: log, threshold: thresholdBytes}
 }
 

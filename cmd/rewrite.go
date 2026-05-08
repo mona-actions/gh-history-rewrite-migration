@@ -7,25 +7,22 @@ import (
 	"github.com/mona-actions/gh-history-rewrite-migration/internal/filterrepo"
 	"github.com/mona-actions/gh-history-rewrite-migration/internal/largefiles"
 	"github.com/mona-actions/gh-history-rewrite-migration/internal/output"
+	"github.com/mona-actions/gh-history-rewrite-migration/internal/remap"
 	"github.com/mona-actions/gh-history-rewrite-migration/internal/rewriter"
 	"github.com/mona-actions/gh-history-rewrite-migration/internal/workdir"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 )
 
-// outputLogger adapts the output package's package-level printers to the
-// Logger interfaces consumed by filterrepo / largefiles / rewriter.
-type outputLogger struct{}
-
-func (outputLogger) Info(m string)  { output.Info(m) }
-func (outputLogger) Warn(m string)  { output.Warn(m) }
-func (outputLogger) Error(m string) { output.Error(m) }
-
 // rewriteCmd implements the standalone `rewrite` subcommand.
 var rewriteCmd = &cobra.Command{
 	Use:   "rewrite",
 	Short: "Rewrite git history using filter-repo before import",
-	Long: `Run git filter-repo against the bare repository extracted by 'export'.
+	Long: `Rewrite git history and remap metadata SHAs for the archives produced by 'export'.
+
+This command runs two phases:
+  1. git filter-repo on the bare repository (history rewrite)
+  2. SHA remapping in metadata JSONs using the commit-map produced by filter-repo
 
 Supports three optional, composable rewrite operations:
   - --strip-large-files  : analyze + strip files exceeding the size threshold
@@ -33,7 +30,8 @@ Supports three optional, composable rewrite operations:
   - --filter-repo-flag   : pass through arbitrary filter-repo flags
 
 A confirmation gate (Gate 1) prompts before stripping; bypass with --yes.
-The rewritten commit-map is copied to <work-dir>/commit-map for the remap step.`,
+After rewriting, the metadata archive is updated with remapped SHAs so
+'migrate' only needs to import.`,
 	RunE: runRewrite,
 }
 
@@ -57,7 +55,7 @@ func runRewrite(cmd *cobra.Command, _ []string) error {
 		ctx = context.Background()
 	}
 
-	wd, err := workdir.New(viper.GetString("WORK_DIR"))
+	wd, err := workdir.New(resolveWorkDir(cmd))
 	if err != nil {
 		return fmt.Errorf("failed to initialize work directory: %w", err)
 	}
@@ -82,7 +80,7 @@ func runRewrite(cmd *cobra.Command, _ []string) error {
 	yes, _ := cmd.Flags().GetBool("yes")
 	nonInteractive, _ := cmd.Flags().GetBool("non-interactive")
 
-	log := outputLogger{}
+	log := output.PackageLogger{}
 	runner := filterrepo.New(filterrepo.DefaultExecer{}, log)
 	analyzer := largefiles.New(runner, log, threshold)
 
@@ -103,5 +101,29 @@ func runRewrite(cmd *cobra.Command, _ []string) error {
 	if res != nil {
 		res.Render(output.Table, output.Warn)
 	}
+
+	// Phase 2: remap metadata SHAs using the commit-map from filter-repo.
+	if wd.HasCommitMap() {
+		output.Info("Remapping commit SHAs in metadata archive...")
+		remapper := remap.NewReal(output.PackageLogger{})
+		remapIn := remap.Input{
+			WorkDir:              wd,
+			RawMetadataArchive:   wd.RawMetadataArchive(),
+			CommitMapPath:        wd.CommitMap(),
+			MetadataExtractedDir: wd.MetadataExtractedDir(),
+		}
+		remapRes, err := remapper.Run(ctx, remapIn)
+		if err != nil {
+			return fmt.Errorf("remap phase failed: %w", err)
+		}
+		for _, warning := range remapRes.Warnings {
+			output.Warn(warning)
+		}
+		output.Info(fmt.Sprintf("Remap complete: %d commits remapped, %d files scanned",
+			remapRes.CommitsRemapped, remapRes.FilesScanned))
+	} else {
+		output.Warn("no commit-map found; skipping metadata remap (filter-repo produced no rewrites)")
+	}
+
 	return nil
 }

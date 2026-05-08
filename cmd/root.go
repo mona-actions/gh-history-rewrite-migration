@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -44,22 +45,23 @@ func init() {
 
 	// Bind flags to Viper
 	// Priority: Flag value > Environment variable > Default value
-	viper.BindPFlag("WORK_DIR", rootCmd.PersistentFlags().Lookup("work-dir"))
-	viper.BindPFlag("ORG", rootCmd.PersistentFlags().Lookup("org"))
-	viper.BindPFlag("REPO", rootCmd.PersistentFlags().Lookup("repo"))
-	viper.BindPFlag("TARGET_ORG", rootCmd.PersistentFlags().Lookup("target-org"))
-	viper.BindPFlag("SOURCE_HOSTNAME", rootCmd.PersistentFlags().Lookup("source-hostname"))
-	viper.BindPFlag("LARGE_FILE_THRESHOLD", rootCmd.PersistentFlags().Lookup("large-file-threshold"))
-	viper.BindPFlag("NO_COLOR", rootCmd.PersistentFlags().Lookup("no-color"))
+	_ = viper.BindPFlag("WORK_DIR", rootCmd.PersistentFlags().Lookup("work-dir"))
+	_ = viper.BindPFlag("ORG", rootCmd.PersistentFlags().Lookup("org"))
+	_ = viper.BindPFlag("REPO", rootCmd.PersistentFlags().Lookup("repo"))
+	_ = viper.BindPFlag("TARGET_ORG", rootCmd.PersistentFlags().Lookup("target-org"))
+	_ = viper.BindPFlag("SOURCE_HOSTNAME", rootCmd.PersistentFlags().Lookup("source-hostname"))
+	_ = viper.BindPFlag("LARGE_FILE_THRESHOLD", rootCmd.PersistentFlags().Lookup("large-file-threshold"))
+	_ = viper.BindPFlag("NO_COLOR", rootCmd.PersistentFlags().Lookup("no-color"))
 
 	// Set default values
 	viper.SetDefault("WORK_DIR", "./work")
 	viper.SetDefault("SOURCE_HOSTNAME", "github.com")
 	viper.SetDefault("LARGE_FILE_THRESHOLD", "400M")
+	viper.SetDefault("EXPORT_MODE", "two")
 
 	// Bind environment variables explicitly for PAT authentication
-	viper.BindEnv("GH_SOURCE_PAT")
-	viper.BindEnv("GH_PAT")
+	_ = viper.BindEnv("GH_SOURCE_PAT")
+	_ = viper.BindEnv("GH_PAT")
 }
 
 // checkRequiredVars validates that all required configuration values are set
@@ -70,4 +72,25 @@ func checkRequiredVars(required ...string) error {
 		}
 	}
 	return nil
+}
+
+// resolveWorkDir returns the effective work directory. When --work-dir
+// was not explicitly set (using the default "./work"), the path is
+// auto-namespaced by org/repo so multiple repos can coexist without
+// cleanup. An explicit --work-dir or GHHRM_WORK_DIR is used as-is.
+func resolveWorkDir(cmd *cobra.Command) string {
+	base := viper.GetString("WORK_DIR")
+	org := viper.GetString("ORG")
+	repo := viper.GetString("REPO")
+
+	// If the user explicitly set --work-dir, respect it verbatim.
+	if cmd.Flags().Changed("work-dir") || os.Getenv("GHHRM_WORK_DIR") != "" {
+		return base
+	}
+
+	// Auto-namespace under the default work dir.
+	if org != "" && repo != "" {
+		return filepath.Join(base, org, repo)
+	}
+	return base
 }

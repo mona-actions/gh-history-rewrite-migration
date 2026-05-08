@@ -3,11 +3,13 @@ package migrate
 import (
 	"context"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 
 	"github.com/mona-actions/gh-history-rewrite-migration/internal/remap"
 	"github.com/mona-actions/gh-history-rewrite-migration/internal/rewriter"
+	"github.com/mona-actions/gh-history-rewrite-migration/internal/workdir"
 )
 
 // --- fakes ---------------------------------------------------------------
@@ -32,18 +34,18 @@ type fakeRewriter struct {
 	err    error
 }
 
-func (f *fakeRewriter) Run(ctx context.Context) (*rewriter.Result, error) {
+func (f *fakeRewriter) Run(ctx context.Context, inputs ...rewriter.Input) (*rewriter.Result, error) {
 	f.called = true
 	return f.res, f.err
 }
 
 type fakeRemapper struct {
 	called bool
-	res    *remap.Result
+	res    remap.Result
 	err    error
 }
 
-func (f *fakeRemapper) Run(ctx context.Context, in remap.Input) (*remap.Result, error) {
+func (f *fakeRemapper) Run(ctx context.Context, in remap.Input) (remap.Result, error) {
 	f.called = true
 	return f.res, f.err
 }
@@ -84,14 +86,28 @@ func build(t *testing.T,
 	cfg Config,
 ) (*Orchestrator, *recorder) {
 	t.Helper()
+	wd, err := workdir.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("workdir.New: %v", err)
+	}
+	if err := os.WriteFile(wd.RawMetadataArchive(), []byte("raw metadata"), 0o644); err != nil {
+		t.Fatalf("write raw metadata: %v", err)
+	}
+	if err := os.WriteFile(wd.CommitMap(), []byte("old new\n"), 0o644); err != nil {
+		t.Fatalf("write commit-map: %v", err)
+	}
+
 	rec := &recorder{}
-	// Pass nil workdir; tests don't need on-disk artifact checks
-	// (workDirHasArtifacts returns false on nil).
 	var dr DoctorRunner
 	if d != nil {
 		dr = d
 	}
-	o := New(nil, dr, e, rw, rm, im, remap.Input{}, cfg, rec.printers())
+	cfg.Resume = true
+	o := New(wd, dr, e, rw, rm, im, remap.Input{
+		WorkDir:            wd,
+		RawMetadataArchive: wd.RawMetadataArchive(),
+		CommitMapPath:      wd.CommitMap(),
+	}, cfg, rec.printers())
 	return o, rec
 }
 
@@ -101,7 +117,7 @@ func TestRun_HappyPath(t *testing.T) {
 	d := &fakeDoctor{}
 	e := &fakeExporter{}
 	rw := &fakeRewriter{res: &rewriter.Result{StripPerformed: true}}
-	rm := &fakeRemapper{res: &remap.Result{}}
+	rm := &fakeRemapper{res: remap.Result{}}
 	im := &fakeImporter{}
 
 	o, rec := build(t, d, e, rw, rm, im, Config{TargetRepoURL: "https://github.com/x/y"})
@@ -157,7 +173,7 @@ func TestRun_ExporterFails_AbortsBeforeRewriteRemapImport(t *testing.T) {
 func TestRun_RewriterIdempotentSkip_ContinuesToRemap(t *testing.T) {
 	e := &fakeExporter{}
 	rw := &fakeRewriter{res: nil, err: nil} // nil/nil = idempotent skip
-	rm := &fakeRemapper{res: &remap.Result{}}
+	rm := &fakeRemapper{res: remap.Result{}}
 	im := &fakeImporter{}
 
 	o, rec := build(t, nil, e, rw, rm, im, Config{})
@@ -177,7 +193,7 @@ func TestRun_RewriterWarningsRendered(t *testing.T) {
 	rw := &fakeRewriter{res: &rewriter.Result{
 		Warnings: []string{"GPG signatures stripped", "LFS pointers detected"},
 	}}
-	rm := &fakeRemapper{res: &remap.Result{}}
+	rm := &fakeRemapper{res: remap.Result{}}
 	im := &fakeImporter{}
 
 	o, rec := build(t, nil, e, rw, rm, im, Config{})
@@ -190,22 +206,19 @@ func TestRun_RewriterWarningsRendered(t *testing.T) {
 	}
 }
 
-func TestRun_RemapUpstreamPending_AbortsBeforeImport(t *testing.T) {
+func TestRun_RemapError_AbortsBeforeImport(t *testing.T) {
 	e := &fakeExporter{}
 	rw := &fakeRewriter{res: &rewriter.Result{}}
-	rm := &fakeRemapper{err: remap.ErrUpstreamPending}
+	rm := &fakeRemapper{err: errors.New("metadata remap failed")}
 	im := &fakeImporter{}
 
-	o, rec := build(t, nil, e, rw, rm, im, Config{})
+	o, _ := build(t, nil, e, rw, rm, im, Config{})
 	err := o.Run(context.Background())
-	if !errors.Is(err, remap.ErrUpstreamPending) {
-		t.Fatalf("expected ErrUpstreamPending, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "remap phase failed") {
+		t.Fatalf("expected wrapped remap failure, got %v", err)
 	}
 	if im.called {
-		t.Errorf("importer must NOT run when remap is pending upstream")
-	}
-	if !strings.Contains(rec.joined(), "MANUAL-REMAP.md") {
-		t.Errorf("expected manual-remap pointer in warning, got: %s", rec.joined())
+		t.Errorf("importer must NOT run when remap fails")
 	}
 }
 
@@ -228,7 +241,7 @@ func TestRun_RemapOtherError_Aborts(t *testing.T) {
 func TestRun_ImporterFails_ReturnsError(t *testing.T) {
 	e := &fakeExporter{}
 	rw := &fakeRewriter{res: &rewriter.Result{}}
-	rm := &fakeRemapper{res: &remap.Result{}}
+	rm := &fakeRemapper{res: remap.Result{}}
 	im := &fakeImporter{err: errors.New("gei exit 1")}
 
 	o, _ := build(t, nil, e, rw, rm, im, Config{})
@@ -243,11 +256,52 @@ func TestRun_ImporterFails_ReturnsError(t *testing.T) {
 	}
 }
 
+func TestRun_NoCommitMap_CopiesRawMetadataAndSkipsRemap(t *testing.T) {
+	wd, err := workdir.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("workdir.New: %v", err)
+	}
+	if err := os.WriteFile(wd.RawMetadataArchive(), []byte("raw metadata"), 0o644); err != nil {
+		t.Fatalf("write raw metadata: %v", err)
+	}
+
+	e := &fakeExporter{}
+	rw := &fakeRewriter{res: &rewriter.Result{}}
+	rm := &fakeRemapper{}
+	im := &fakeImporter{}
+	rec := &recorder{}
+	o := New(wd, nil, e, rw, rm, im, remap.Input{
+		WorkDir:            wd,
+		RawMetadataArchive: wd.RawMetadataArchive(),
+		CommitMapPath:      wd.CommitMap(),
+	}, Config{Resume: true}, rec.printers())
+
+	if err := o.Run(context.Background()); err != nil {
+		t.Fatalf("expected success, got %v", err)
+	}
+	if rm.called {
+		t.Fatal("remapper should not run when no commit-map exists")
+	}
+	if !im.called {
+		t.Fatal("importer should run when remap is skipped")
+	}
+	got, err := os.ReadFile(wd.MetadataArchive())
+	if err != nil {
+		t.Fatalf("read final metadata archive: %v", err)
+	}
+	if string(got) != "raw metadata" {
+		t.Fatalf("expected final metadata archive to match raw metadata, got %q", string(got))
+	}
+	if !strings.Contains(rec.joined(), "no rewrites performed; using original metadata archive") {
+		t.Fatalf("expected no-op remap warning, got %s", rec.joined())
+	}
+}
+
 func TestNew_NilPrintersAreNoOp(t *testing.T) {
 	// Construct with empty Printers and ensure Run doesn't panic.
 	o := New(nil, nil,
 		&fakeExporter{}, &fakeRewriter{res: &rewriter.Result{}},
-		&fakeRemapper{res: &remap.Result{}}, &fakeImporter{},
+		&fakeRemapper{res: remap.Result{}}, &fakeImporter{},
 		remap.Input{}, Config{}, Printers{})
 	if err := o.Run(context.Background()); err != nil {
 		t.Fatalf("unexpected error with nil printers: %v", err)

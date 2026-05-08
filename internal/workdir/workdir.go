@@ -1,13 +1,15 @@
+// Package workdir manages the on-disk directory layout for a single migration.
 package workdir
 
 import (
 	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
+
+	"github.com/mona-actions/gh-history-rewrite-migration/internal/atomicfs"
 )
 
 // WorkDir manages the working directory structure for migration artifacts.
@@ -29,7 +31,7 @@ func New(root string) (*WorkDir, error) {
 	if err := os.WriteFile(testFile, []byte("test"), 0644); err != nil {
 		return nil, fmt.Errorf("work directory is not writable: %w", err)
 	}
-	os.Remove(testFile)
+	_ = os.Remove(testFile)
 
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
@@ -39,19 +41,24 @@ func New(root string) (*WorkDir, error) {
 	return &WorkDir{root: absRoot}, nil
 }
 
-// Archive returns the absolute path to the combined archive downloaded from GitHub.
-func (w *WorkDir) Archive() string {
-	return filepath.Join(w.root, "archive.tar.gz")
+// RawGitArchive returns the absolute path to the raw git archive downloaded from GitHub.
+func (w *WorkDir) RawGitArchive() string {
+	return filepath.Join(w.root, "git_archive_raw.tar.gz")
 }
 
-// Extracted returns the absolute path to the extracted archive directory.
-func (w *WorkDir) Extracted() string {
-	return filepath.Join(w.root, "extracted")
+// RawMetadataArchive returns the absolute path to the raw metadata archive downloaded from GitHub.
+func (w *WorkDir) RawMetadataArchive() string {
+	return filepath.Join(w.root, "metadata_archive_raw.tar.gz")
 }
 
-// CommitMap returns the absolute path to the commit mapping file.
-func (w *WorkDir) CommitMap() string {
-	return filepath.Join(w.root, "commit-map")
+// GitExtractedDir returns the absolute path to the extracted git archive directory.
+func (w *WorkDir) GitExtractedDir() string {
+	return filepath.Join(w.root, "git_extracted")
+}
+
+// MetadataExtractedDir returns the absolute path to the extracted metadata archive directory.
+func (w *WorkDir) MetadataExtractedDir() string {
+	return filepath.Join(w.root, "metadata_extracted")
 }
 
 // GitArchive returns the absolute path to the rewritten git archive.
@@ -64,54 +71,39 @@ func (w *WorkDir) MetadataArchive() string {
 	return filepath.Join(w.root, "metadata_archive.tar.gz")
 }
 
+// CommitMap returns the absolute path to the commit mapping file.
+func (w *WorkDir) CommitMap() string {
+	return filepath.Join(w.root, "commit-map")
+}
+
+// ExportModeFile returns the absolute path to the persisted export mode marker.
+func (w *WorkDir) ExportModeFile() string {
+	return filepath.Join(w.root, ".export-mode")
+}
+
+// CombinedRawArchive returns the absolute path to the internal combined-mode raw archive.
+func (w *WorkDir) CombinedRawArchive() string {
+	return filepath.Join(w.root, "_combined_raw.tar.gz")
+}
+
+// CombinedSplitDir returns the absolute path to the combined-mode extraction scratch directory.
+func (w *WorkDir) CombinedSplitDir() string {
+	return filepath.Join(w.root, "_combined_split")
+}
+
+// GitStageDir returns the absolute path to the combined-mode git split staging directory.
+func (w *WorkDir) GitStageDir() string {
+	return filepath.Join(w.root, "_git_stage")
+}
+
+// MetaStageDir returns the absolute path to the combined-mode metadata split staging directory.
+func (w *WorkDir) MetaStageDir() string {
+	return filepath.Join(w.root, "_meta_stage")
+}
+
 // CleanupTxt returns the absolute path to the cleanup instructions file.
 func (w *WorkDir) CleanupTxt() string {
 	return filepath.Join(w.root, "cleanup.txt")
-}
-
-// BareRepoPath walks the extracted directory tree and returns the unique *.git directory.
-// Returns an error if zero or more than one .git directories are found.
-func (w *WorkDir) BareRepoPath() (string, error) {
-	extracted := w.Extracted()
-
-	// Check if extracted directory exists
-	if _, err := os.Stat(extracted); os.IsNotExist(err) {
-		return "", fmt.Errorf("extracted directory does not exist: %s", extracted)
-	}
-
-	var gitDirs []string
-
-	err := filepath.WalkDir(extracted, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-
-		if d.IsDir() && strings.HasSuffix(d.Name(), ".git") {
-			gitDirs = append(gitDirs, path)
-		}
-
-		return nil
-	})
-
-	if err != nil {
-		return "", fmt.Errorf("failed to walk extracted directory: %w", err)
-	}
-
-	if len(gitDirs) == 0 {
-		return "", fmt.Errorf("no .git directory found in %s", extracted)
-	}
-
-	if len(gitDirs) > 1 {
-		return "", fmt.Errorf("multiple .git directories found in %s: %v", extracted, gitDirs)
-	}
-
-	return gitDirs[0], nil
-}
-
-// HasArchive checks if the downloaded archive exists.
-func (w *WorkDir) HasArchive() bool {
-	_, err := os.Stat(w.Archive())
-	return err == nil
 }
 
 // HasCommitMap checks if the commit map file exists.
@@ -163,7 +155,7 @@ func (w *WorkDir) Lock() error {
 			}
 			return false, fmt.Errorf("failed to create lock file: %w", err)
 		}
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 		_, err = fmt.Fprintf(f, "%d\n", os.Getpid())
 		if err != nil {
 			// Don't leave an empty .lock behind — future callers would
@@ -179,7 +171,7 @@ func (w *WorkDir) Lock() error {
 		return err
 	}
 	if created {
-		return nil
+		return w.sweepPartialsAfterLock()
 	}
 
 	// Lock file exists — check liveness of the holder.
@@ -220,6 +212,14 @@ func (w *WorkDir) Lock() error {
 	}
 	if !created {
 		return fmt.Errorf("work directory is locked (lost stale-lock takeover race)")
+	}
+	return w.sweepPartialsAfterLock()
+}
+
+func (w *WorkDir) sweepPartialsAfterLock() error {
+	if err := atomicfs.SweepPartials(w.root); err != nil {
+		_ = w.Unlock()
+		return fmt.Errorf("failed to sweep partial files: %w", err)
 	}
 	return nil
 }

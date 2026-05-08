@@ -27,7 +27,7 @@ func (r *Result) Render(printer TablePrinter, warn WarnFn) {
 		printer = output.Table
 	}
 	if warn == nil {
-		warn = output.Warn
+		warn = func(msg string) { output.Warn(msg) }
 	}
 
 	scripts := strings.Join(r.ScriptsRun, ", ")

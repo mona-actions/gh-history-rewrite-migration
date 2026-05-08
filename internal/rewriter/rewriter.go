@@ -16,20 +16,30 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/mona-actions/gh-commit-remap/pkg/archive"
+
+	"github.com/mona-actions/gh-history-rewrite-migration/internal/atomicfs"
 	"github.com/mona-actions/gh-history-rewrite-migration/internal/filterrepo"
 	"github.com/mona-actions/gh-history-rewrite-migration/internal/largefiles"
 	"github.com/mona-actions/gh-history-rewrite-migration/internal/output"
-	"github.com/mona-actions/gh-history-rewrite-migration/internal/remap"
 	"github.com/mona-actions/gh-history-rewrite-migration/internal/workdir"
 )
 
-// Logger is the minimal logging surface the rewriter needs. A nil logger
-// is safe — internal helpers fall back to the package-level `output`
-// printers so library callers without a logger still see progress.
-type Logger interface {
-	Info(msg string)
-	Warn(msg string)
-	Error(msg string)
+const defaultLargeFileThreshold = 400 * 1024 * 1024
+
+// Input is the v2, mode-unaware rewrite contract. The rewriter derives all
+// artifact locations from WorkDir instead of accepting mode-specific paths.
+type Input struct {
+	WorkDir         *workdir.WorkDir
+	LargeFileThresh int64
+	UserCallbacks   []string
+
+	// Existing user-facing flags preserved from the v1 config.
+	StripLargeFiles   bool
+	FilterRepoScripts []string
+	FilterRepoFlags   []string
+	SkipConfirm       bool
+	NonInteractive    bool
 }
 
 // Config holds user-supplied configuration for a rewrite run.
@@ -91,7 +101,7 @@ type Rewriter struct {
 	wd       *workdir.WorkDir
 	runner   runnerIface
 	analyzer analyzerIface
-	log      Logger
+	log      output.Logger
 	cfg      Config
 
 	// Injectable for tests.
@@ -101,14 +111,14 @@ type Rewriter struct {
 
 // New constructs a Rewriter wired to production filterrepo / largefiles
 // implementations. The logger may be nil.
-func New(wd *workdir.WorkDir, runner *filterrepo.Runner, analyzer *largefiles.Analyzer, log Logger, cfg Config) *Rewriter {
+func New(wd *workdir.WorkDir, runner *filterrepo.Runner, analyzer *largefiles.Analyzer, log output.Logger, cfg Config) *Rewriter {
 	return newWithDeps(wd, runner, analyzer, log, cfg)
 }
 
 // newWithDeps is the shared constructor. Tests pass interface stubs;
 // New() passes the concrete production types (which implement the
 // interfaces directly).
-func newWithDeps(wd *workdir.WorkDir, runner runnerIface, analyzer analyzerIface, log Logger, cfg Config) *Rewriter {
+func newWithDeps(wd *workdir.WorkDir, runner runnerIface, analyzer analyzerIface, log output.Logger, cfg Config) *Rewriter {
 	return &Rewriter{
 		wd:       wd,
 		runner:   runner,
@@ -136,54 +146,68 @@ func (r *Rewriter) warn(msg string) {
 	output.Warn(msg)
 }
 
-// Run executes the rewrite pipeline. The order of side effects is:
-//
-//  1. Idempotency check (skip if commit-map already handed off).
-//  2. Validate user flags + callback script kinds.
-//  3. Optional large-file analyze → cleanup.txt → Gate 1 → strip.
-//  4. Optional user callback scripts (separate filter-repo invocation).
-//  5. Optional user passthrough flags (separate filter-repo invocation).
-//  6. Informational warnings (GPG, LFS).
-//  7. Commit-map handoff to wd.CommitMap().
-//
-// Returns a *Result describing what happened, or an error on the first
-// fatal step. A nil Result with nil error indicates an idempotent skip.
-func (r *Rewriter) Run(ctx context.Context) (*Result, error) {
-	bareRepoPath, err := r.wd.BareRepoPath()
+// Run executes the v2 mode-unaware rewrite pipeline. New callers pass an
+// Input explicitly; legacy callers constructed with New may omit it, in which
+// case the constructor WorkDir/Config are used.
+func (r *Rewriter) Run(ctx context.Context, inputs ...Input) (*Result, error) {
+	in, err := r.resolveInput(inputs)
 	if err != nil {
 		return nil, err
 	}
-	bareCommitMap := filepath.Join(bareRepoPath, "filter-repo", "commit-map")
+	r.wd = in.WorkDir
+	r.cfg = Config{
+		StripLargeFiles:    in.StripLargeFiles,
+		LargeFileThreshold: in.LargeFileThresh,
+		FilterRepoScripts:  append([]string(nil), in.FilterRepoScripts...),
+		FilterRepoFlags:    append([]string(nil), in.FilterRepoFlags...),
+		SkipConfirm:        in.SkipConfirm,
+		NonInteractive:     in.NonInteractive,
+	}
 
-	// 1. Idempotency.
-	if r.wd.HasCommitMap() {
-		if _, statErr := os.Stat(bareCommitMap); statErr == nil {
-			r.info("rewrite already applied; skipping")
-			return nil, nil
+	rawGit := in.WorkDir.RawGitArchive()
+	extractDir := in.WorkDir.GitExtractedDir()
+	finalArchive := in.WorkDir.GitArchive()
+
+	if atomicfs.IsFileComplete(finalArchive) {
+		r.info("rewritten git archive already exists; skipping")
+		return r.cachedResult(), nil
+	}
+
+	if !atomicfs.IsDirComplete(extractDir) {
+		if err := os.RemoveAll(extractDir); err != nil {
+			return nil, fmt.Errorf("prepare git extraction dir: %w", err)
+		}
+		if _, err := archive.UnTar(rawGit, extractDir); err != nil {
+			return nil, fmt.Errorf("extract raw git archive %s: %w", rawGit, err)
+		}
+		if err := atomicfs.MarkDirComplete(extractDir); err != nil {
+			return nil, fmt.Errorf("mark git extraction complete: %w", err)
 		}
 	}
 
-	// 2a. Validate user passthrough flags.
+	bareRepoPath, err := workdir.FindBareRepo(extractDir)
+	if err != nil {
+		return nil, wrapFindBareRepoError(extractDir, err)
+	}
+	bareCommitMap := filepath.Join(bareRepoPath, "filter-repo", "commit-map")
+
 	if len(r.cfg.FilterRepoFlags) > 0 {
 		if err := filterrepo.ValidateUserFlags(r.cfg.FilterRepoFlags, r.cfg.StripLargeFiles); err != nil {
 			return nil, err
 		}
 	}
-	// 2b. Validate callback scripts.
 	if err := r.validateScripts(); err != nil {
 		return nil, err
 	}
 
 	result := &Result{}
 
-	// 3. Large-files analyze + strip.
 	if r.cfg.StripLargeFiles {
 		if err := r.runStrip(ctx, bareRepoPath, result); err != nil {
 			return nil, err
 		}
 	}
 
-	// 4. User callback scripts.
 	if len(r.cfg.FilterRepoScripts) > 0 {
 		if err := r.runner.RunCallbackScripts(ctx, bareRepoPath, r.cfg.FilterRepoScripts); err != nil {
 			return nil, fmt.Errorf("filter-repo callbacks: %w", err)
@@ -193,7 +217,6 @@ func (r *Rewriter) Run(ctx context.Context) (*Result, error) {
 		}
 	}
 
-	// 5. User passthrough flags.
 	if len(r.cfg.FilterRepoFlags) > 0 {
 		if err := r.runner.Run(ctx, bareRepoPath, r.cfg.FilterRepoFlags); err != nil {
 			return nil, fmt.Errorf("filter-repo passthrough: %w", err)
@@ -201,7 +224,6 @@ func (r *Rewriter) Run(ctx context.Context) (*Result, error) {
 		result.UserFlagsApplied = sanitizeUserFlags(r.cfg.FilterRepoFlags)
 	}
 
-	// 6a. GPG warning — informational; filter-repo always strips signatures.
 	rewriteRan := result.StripPerformed || len(result.ScriptsRun) > 0 || len(result.UserFlagsApplied) > 0
 	if rewriteRan {
 		w := "git filter-repo strips GPG signatures; rewritten commits will be unsigned."
@@ -209,24 +231,92 @@ func (r *Rewriter) Run(ctx context.Context) (*Result, error) {
 		r.warn(w)
 	}
 
-	// 6b. LFS orphan warning.
 	if w := r.lfsWarning(bareRepoPath); w != "" {
 		result.Warnings = append(result.Warnings, w)
 		r.warn(w)
 	}
 
-	// 7. Commit-map handoff.
 	if w := r.handoffCommitMap(bareCommitMap); w != "" {
 		result.Warnings = append(result.Warnings, w)
 		r.warn(w)
 	}
 	if r.wd.HasCommitMap() {
-		if n, err := remap.CountCommitsRemapped(r.wd.CommitMap()); err == nil {
+		if n, err := filterrepo.CountCommitsRemapped(r.wd.CommitMap()); err == nil {
 			result.CommitsRemapped = n
 		}
 	}
 
+	if err := atomicfs.WriteFileAtomicPath(finalArchive, func(partialPath string) error {
+		return archive.ReTarDir(extractDir, partialPath)
+	}); err != nil {
+		return nil, fmt.Errorf("write rewritten git archive: %w", err)
+	}
+
 	return result, nil
+}
+
+func (r *Rewriter) resolveInput(inputs []Input) (Input, error) {
+	if len(inputs) > 1 {
+		return Input{}, errors.New("rewriter: Run accepts at most one Input")
+	}
+	if len(inputs) == 1 {
+		in := inputs[0]
+		if in.WorkDir == nil {
+			return Input{}, errors.New("rewriter: WorkDir is nil")
+		}
+		if in.LargeFileThresh <= 0 {
+			in.LargeFileThresh = defaultLargeFileThreshold
+		}
+		if len(in.UserCallbacks) > 0 {
+			in.FilterRepoFlags = append(callbackFlags(in.UserCallbacks), in.FilterRepoFlags...)
+		}
+		return in, nil
+	}
+	if r.wd == nil {
+		return Input{}, errors.New("rewriter: WorkDir is nil")
+	}
+	threshold := r.cfg.LargeFileThreshold
+	if threshold <= 0 {
+		threshold = defaultLargeFileThreshold
+	}
+	return Input{
+		WorkDir:           r.wd,
+		LargeFileThresh:   threshold,
+		StripLargeFiles:   r.cfg.StripLargeFiles,
+		FilterRepoScripts: append([]string(nil), r.cfg.FilterRepoScripts...),
+		FilterRepoFlags:   append([]string(nil), r.cfg.FilterRepoFlags...),
+		SkipConfirm:       r.cfg.SkipConfirm,
+		NonInteractive:    r.cfg.NonInteractive,
+	}, nil
+}
+
+func callbackFlags(callbacks []string) []string {
+	flags := make([]string, 0, len(callbacks))
+	for _, cb := range callbacks {
+		flags = append(flags, "--commit-callback="+cb)
+	}
+	return flags
+}
+
+func (r *Rewriter) cachedResult() *Result {
+	res := &Result{}
+	if r.wd != nil && r.wd.HasCommitMap() {
+		if n, err := filterrepo.CountCommitsRemapped(r.wd.CommitMap()); err == nil {
+			res.CommitsRemapped = n
+		}
+	}
+	return res
+}
+
+func wrapFindBareRepoError(root string, err error) error {
+	switch {
+	case errors.Is(err, workdir.ErrMultipleBareRepos):
+		return fmt.Errorf("multi-repo migrations are not supported: extracted git archive contains multiple .git directories under %s; please migrate one repo at a time: %w", root, err)
+	case errors.Is(err, workdir.ErrNoBareRepo):
+		return fmt.Errorf("no .git directory found under %s; archive may be corrupt or empty: %w", root, err)
+	default:
+		return err
+	}
 }
 
 func (r *Rewriter) runStrip(ctx context.Context, bareRepoPath string, result *Result) error {
@@ -312,9 +402,10 @@ func (r *Rewriter) printFlaggedTable(report *largefiles.Report) {
 // detected near the bare repo. filter-repo does not rewrite LFS pointer
 // mappings; the operator must handle LFS separately.
 func (r *Rewriter) lfsWarning(bareRepoPath string) string {
+	extractRoot := r.wd.GitExtractedDir()
 	candidates := []string{
 		filepath.Join(bareRepoPath, "lfs", "objects"),
-		filepath.Join(r.wd.Extracted(), "git-lfs"),
+		filepath.Join(extractRoot, "git-lfs"),
 	}
 	for _, p := range candidates {
 		info, err := os.Stat(p)
@@ -335,30 +426,18 @@ func (r *Rewriter) handoffCommitMap(srcCommitMap string) string {
 		return "no commit-map produced by filter-repo; remap step will be unable to translate SHAs."
 	}
 	dst := r.wd.CommitMap()
-	if err := os.Rename(srcCommitMap, dst); err == nil {
-		return ""
-	}
-	if err := copyFile(srcCommitMap, dst); err != nil {
+	if err := atomicfs.WriteFileAtomic(dst, func(w io.Writer) error {
+		in, err := os.Open(srcCommitMap)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = in.Close() }()
+		_, err = io.Copy(w, in)
+		return err
+	}); err != nil {
 		return fmt.Sprintf("failed to copy commit-map to %s: %v", dst, err)
 	}
 	return ""
-}
-
-func copyFile(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	out, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = out.Close() }()
-	if _, err := io.Copy(out, in); err != nil {
-		return err
-	}
-	return out.Close()
 }
 
 // sanitizeUserFlags returns the argv tokens with any embedded callback

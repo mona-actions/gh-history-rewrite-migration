@@ -1,3 +1,4 @@
+// Package doctor runs preflight checks to validate tool dependencies and connectivity.
 package doctor
 
 import (

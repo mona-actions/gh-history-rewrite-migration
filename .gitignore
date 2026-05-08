@@ -34,3 +34,6 @@ gh-history-rewrite-migration
 .env
 .envrc
 /.reference/
+
+# Local fixtures
+internal/testdata/

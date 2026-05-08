@@ -29,11 +29,13 @@ func init() {
 	exportCmd.Flags().Bool("exclude-metadata", false, "Exclude issue/PR metadata from the archive")
 	exportCmd.Flags().Bool("exclude-attachments", false, "Exclude issue/PR attachments from the archive")
 	exportCmd.Flags().Bool("lock-repositories", false, "Lock source repositories during migration")
+	exportCmd.Flags().String("export-mode", "two", "Export mode: two or combined")
 
-	viper.BindPFlag("EXCLUDE_RELEASES", exportCmd.Flags().Lookup("exclude-releases"))
-	viper.BindPFlag("EXCLUDE_METADATA", exportCmd.Flags().Lookup("exclude-metadata"))
-	viper.BindPFlag("EXCLUDE_ATTACHMENTS", exportCmd.Flags().Lookup("exclude-attachments"))
-	viper.BindPFlag("LOCK_REPOSITORIES", exportCmd.Flags().Lookup("lock-repositories"))
+	_ = viper.BindPFlag("EXCLUDE_RELEASES", exportCmd.Flags().Lookup("exclude-releases"))
+	_ = viper.BindPFlag("EXCLUDE_METADATA", exportCmd.Flags().Lookup("exclude-metadata"))
+	_ = viper.BindPFlag("EXCLUDE_ATTACHMENTS", exportCmd.Flags().Lookup("exclude-attachments"))
+	_ = viper.BindPFlag("LOCK_REPOSITORIES", exportCmd.Flags().Lookup("lock-repositories"))
+	_ = viper.BindPFlag("EXPORT_MODE", exportCmd.Flags().Lookup("export-mode"))
 
 	rootCmd.AddCommand(exportCmd)
 }
@@ -68,6 +70,13 @@ func warnInertExportFlags(cmd *cobra.Command) {
 		"--exclude-metadata is currently inert (go-github v62 does not expose this option)")
 }
 
+func exportModeValue(cmd *cobra.Command) string {
+	if f := cmd.Flags().Lookup("export-mode"); f != nil && f.Changed {
+		return f.Value.String()
+	}
+	return viper.GetString("EXPORT_MODE")
+}
+
 func runExport(cmd *cobra.Command, _ []string) error {
 	if err := checkRequiredVars("ORG", "REPO", "WORK_DIR", "SOURCE_HOSTNAME"); err != nil {
 		return err
@@ -83,7 +92,7 @@ func runExport(cmd *cobra.Command, _ []string) error {
 		ctx = context.Background()
 	}
 
-	wd, err := workdir.New(viper.GetString("WORK_DIR"))
+	wd, err := workdir.New(resolveWorkDir(cmd))
 	if err != nil {
 		return fmt.Errorf("failed to initialize work directory: %w", err)
 	}
@@ -104,10 +113,16 @@ func runExport(cmd *cobra.Command, _ []string) error {
 
 	warnInertExportFlags(cmd)
 
+	mode, err := exporter.ParseMode(exportModeValue(cmd))
+	if err != nil {
+		return err
+	}
 	exp := exporter.New(apiClient, wd, exporter.Config{
 		Org:                viper.GetString("ORG"),
 		Repo:               viper.GetString("REPO"),
+		Mode:               mode,
 		LockRepositories:   viper.GetBool("LOCK_REPOSITORIES"),
+		ExcludeReleases:    viper.GetBool("EXCLUDE_RELEASES"),
 		ExcludeAttachments: viper.GetBool("EXCLUDE_ATTACHMENTS"),
 	})
 
