@@ -192,8 +192,7 @@ func (a *API) GetMigration(ctx context.Context, org string, id int64) (*Migratio
 // Follows redirects and streams the content to disk.
 // Respects context cancellation for long downloads.
 func (a *API) DownloadArchive(ctx context.Context, org string, id int64, dest string) error {
-	// Get the pre-signed archive URL. In go-github v85+ this no longer mutates
-	// the shared http.Client.CheckRedirect, so it is safe to call concurrently.
+	// Get the pre-signed archive URL.
 	url, err := a.client.Migrations.MigrationArchiveURL(ctx, org, id)
 	if err != nil {
 		return fmt.Errorf("failed to get archive URL: %w", err)

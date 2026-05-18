@@ -22,6 +22,7 @@ import (
 
 	commitarchive "github.com/mona-actions/gh-commit-remap/pkg/archive"
 	"github.com/mona-actions/gh-history-rewrite-migration/internal/api"
+	"github.com/mona-actions/gh-history-rewrite-migration/internal/output"
 	"github.com/mona-actions/gh-history-rewrite-migration/internal/workdir"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -292,7 +293,10 @@ func TestExporterRunFailedStateKeepsRemote(t *testing.T) {
 func TestExporterRunMigrationDownloadErrorKeepsRemote(t *testing.T) {
 	fake := &fakeAPI{pollSequence: []string{"exported"}, downloadErr: errors.New("boom")}
 	exp, wd := newTestExporter(t, fake, Config{})
-	err := exp.runMigration(context.Background(), api.MigrationOpts{Repositories: []string{"widget"}}, wd.RawGitArchive(), "git archive")
+	ms := output.NewMultiSpinner(1)
+	ms.Start()
+	defer ms.Stop()
+	err := exp.runMigration(context.Background(), ms, 0, api.MigrationOpts{Repositories: []string{"widget"}}, wd.RawGitArchive(), "git archive")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to download git archive")
 	assert.Equal(t, int32(0), atomic.LoadInt32(&fake.deleteCalled))
@@ -301,7 +305,10 @@ func TestExporterRunMigrationDownloadErrorKeepsRemote(t *testing.T) {
 func TestExporterRunMigrationValidationErrorKeepsRemote(t *testing.T) {
 	fake := &fakeAPI{pollSequence: []string{"exported"}, archiveBytes: [][]byte{[]byte("not a tarball")}}
 	exp, wd := newTestExporter(t, fake, Config{})
-	err := exp.runMigration(context.Background(), api.MigrationOpts{Repositories: []string{"widget"}}, wd.RawGitArchive(), "git archive")
+	ms := output.NewMultiSpinner(1)
+	ms.Start()
+	defer ms.Stop()
+	err := exp.runMigration(context.Background(), ms, 0, api.MigrationOpts{Repositories: []string{"widget"}}, wd.RawGitArchive(), "git archive")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "downloaded archive failed validation")
 	assert.Equal(t, int32(0), atomic.LoadInt32(&fake.deleteCalled))

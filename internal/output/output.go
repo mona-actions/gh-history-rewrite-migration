@@ -3,6 +3,7 @@ package output
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"sync"
 
@@ -137,17 +138,55 @@ func (s *SafeSpinner) UpdateText(text string) {
 	s.sp.UpdateText(text)
 }
 
-// Spinner creates and returns a SafeSpinner with the given title.
+// MultiSpinner manages multiple concurrent spinners via pterm's MultiPrinter.
+// Create with NewMultiSpinner(n), call Start() before use, Stop() when done.
+type MultiSpinner struct {
+	multi   *pterm.MultiPrinter
+	writers []io.Writer
+	noOp    bool // true in non-TTY/NO_COLOR mode
+}
+
+func NewMultiSpinner(n int) *MultiSpinner {
+	if viper.GetBool("NO_COLOR") || !IsTerminal() {
+		return &MultiSpinner{noOp: true, writers: make([]io.Writer, n)}
+	}
+	multi := pterm.DefaultMultiPrinter
+	writers := make([]io.Writer, n)
+	for i := range writers {
+		writers[i] = multi.NewWriter()
+	}
+	return &MultiSpinner{multi: &multi, writers: writers}
+}
+
+func (m *MultiSpinner) Start() {
+	if m.noOp {
+		return
+	}
+	m.multi.Start()
+}
+
+func (m *MultiSpinner) Stop() {
+	if m.noOp {
+		return
+	}
+	m.multi.Stop()
+}
+
+// Spinner creates a spinner on the given slot.
+func (m *MultiSpinner) Spinner(slot int, title string) *SafeSpinner {
+	if m.noOp {
+		fmt.Println(title)
+		return &SafeSpinner{sp: nil}
+	}
+	sp, _ := pterm.DefaultSpinner.WithWriter(m.writers[slot]).Start(title)
+	return &SafeSpinner{sp: sp}
+}
+
+// Spinner creates and returns a SafeSpinner with the given title for single-spinner use.
 //
 // In non-interactive environments (no TTY or NO_COLOR set) it returns a no-op
 // spinner that prints plain text instead of spawning pterm's animation goroutine.
-// This is the correct behaviour for CI, tests, and piped output, and it also
-// eliminates the data race between pterm's internal background goroutine and
-// concurrent Stop()/Success()/Fail() calls in non-interactive mode.
-//
-// NOTE: In live-terminal mode with two concurrent spinners, pterm's internal
-// goroutine reads sp.IsActive without synchronization — this is an inherent
-// pterm limitation. go test -race may still fire if tests happen to run in a TTY.
+// This is the correct behaviour for CI, tests, and piped output.
 func Spinner(title string) *SafeSpinner {
 	if viper.GetBool("NO_COLOR") || !IsTerminal() {
 		fmt.Println(title)
