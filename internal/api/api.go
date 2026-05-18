@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/gofri/go-github-ratelimit/github_ratelimit"
-	"github.com/google/go-github/v62/github"
+	"github.com/google/go-github/v86/github"
 	"github.com/shurcooL/githubv4"
 	"golang.org/x/oauth2"
 )
@@ -154,14 +154,14 @@ func (a *API) Reachable(ctx context.Context) error {
 // Returns the migration ID on success.
 func (a *API) StartOrgMigration(ctx context.Context, org string, opts MigrationOpts) (int64, error) {
 	u := fmt.Sprintf("orgs/%v/migrations", org)
-	req, err := a.client.NewRequest("POST", u, opts)
+	req, err := a.client.NewRequest(ctx, "POST", u, opts)
 	if err != nil {
 		return 0, fmt.Errorf("failed to create migration request: %w", err)
 	}
 	req.Header.Set("Accept", "application/vnd.github.wyandotte-preview+json")
 
 	var result github.Migration
-	_, err = a.client.Do(ctx, req, &result)
+	_, err = a.client.Do(req, &result)
 	if err != nil {
 		return 0, fmt.Errorf("failed to start migration: %w", err)
 	}
@@ -192,7 +192,8 @@ func (a *API) GetMigration(ctx context.Context, org string, id int64) (*Migratio
 // Follows redirects and streams the content to disk.
 // Respects context cancellation for long downloads.
 func (a *API) DownloadArchive(ctx context.Context, org string, id int64, dest string) error {
-	// Get the archive URL (this returns a redirect)
+	// Get the pre-signed archive URL. In go-github v85+ this no longer mutates
+	// the shared http.Client.CheckRedirect, so it is safe to call concurrently.
 	url, err := a.client.Migrations.MigrationArchiveURL(ctx, org, id)
 	if err != nil {
 		return fmt.Errorf("failed to get archive URL: %w", err)

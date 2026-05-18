@@ -19,6 +19,7 @@ import (
 	"github.com/mona-actions/gh-history-rewrite-migration/internal/atomicfs"
 	"github.com/mona-actions/gh-history-rewrite-migration/internal/output"
 	"github.com/mona-actions/gh-history-rewrite-migration/internal/workdir"
+	"golang.org/x/sync/errgroup"
 )
 
 // Mode selects how exporter obtains the two raw archives.
@@ -152,15 +153,19 @@ func (e *Exporter) loadOrInitMode(wantMode Mode) (Mode, error) {
 func (e *Exporter) runTwoMode(ctx context.Context) error {
 	base := e.baseToggles()
 	repo := e.repoSlug()
+	g, gctx := errgroup.WithContext(ctx)
 	if !archiveComplete(e.wd.RawGitArchive()) {
-		if err := e.runMigration(ctx, api.GitOnlyMigrationOpts(repo), e.wd.RawGitArchive(), "git archive"); err != nil {
-			return err
-		}
+		g.Go(func() error {
+			return e.runMigration(gctx, api.GitOnlyMigrationOpts(repo), e.wd.RawGitArchive(), "git archive")
+		})
 	}
 	if !archiveComplete(e.wd.RawMetadataArchive()) {
-		if err := e.runMigration(ctx, api.MetadataOnlyMigrationOpts(repo, base), e.wd.RawMetadataArchive(), "metadata archive"); err != nil {
-			return err
-		}
+		g.Go(func() error {
+			return e.runMigration(gctx, api.MetadataOnlyMigrationOpts(repo, base), e.wd.RawMetadataArchive(), "metadata archive")
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return err
 	}
 	output.Success("export complete")
 	return nil
@@ -272,7 +277,7 @@ func archiveComplete(path string) bool {
 func (e *Exporter) pollUntilExported(ctx context.Context, id int64, label string) error {
 	spinner := output.Spinner(fmt.Sprintf("waiting for %s to be exported (state: pending)", label))
 	defer func() {
-		if spinner.IsActive {
+		if spinner.IsActive() {
 			_ = spinner.Stop()
 		}
 	}()
@@ -315,6 +320,12 @@ func (e *Exporter) pollUntilExported(ctx context.Context, id int64, label string
 
 func (e *Exporter) downloadArchive(ctx context.Context, id int64, outPath, label string) error {
 	spinner := output.Spinner(fmt.Sprintf("downloading %s", label))
+	defer func() {
+		// Safety net: stop spinner if an unexpected early return leaves it running.
+		if spinner.IsActive() {
+			_ = spinner.Stop()
+		}
+	}()
 	err := atomicfs.WriteFileAtomicPath(outPath, func(partialPath string) error {
 		return e.api.DownloadArchive(ctx, e.cfg.Org, id, partialPath)
 	})
