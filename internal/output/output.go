@@ -162,14 +162,14 @@ func (m *MultiSpinner) Start() {
 	if m.noOp {
 		return
 	}
-	m.multi.Start()
+	_, _ = m.multi.Start()
 }
 
 func (m *MultiSpinner) Stop() {
 	if m.noOp {
 		return
 	}
-	m.multi.Stop()
+	_, _ = m.multi.Stop()
 }
 
 // Spinner creates a spinner on the given slot.

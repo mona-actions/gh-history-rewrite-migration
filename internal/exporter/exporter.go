@@ -187,11 +187,10 @@ func (e *Exporter) runCombinedMode(ctx context.Context) error {
 	if !archiveComplete(rawCombined) {
 		ms := output.NewMultiSpinner(1)
 		ms.Start()
+		defer ms.Stop()
 		if err := e.runMigration(ctx, ms, 0, api.CombinedMigrationOpts(e.repoSlug(), e.baseToggles()), rawCombined, "combined archive"); err != nil {
-			ms.Stop()
 			return err
 		}
-		ms.Stop()
 	}
 
 	splitDir := e.wd.CombinedSplitDir()
