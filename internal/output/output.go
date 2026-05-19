@@ -3,12 +3,17 @@ package output
 
 import (
 	"fmt"
+	"io"
 	"os"
+	"sync"
 
 	"github.com/pterm/pterm"
 	"github.com/spf13/viper"
 	"golang.org/x/term"
 )
+
+// mu serializes all pterm calls; pterm has unsynchronized global state.
+var mu sync.Mutex
 
 // Logger is the minimal structured logging surface shared by packages that
 // accept an injected logger.
@@ -31,6 +36,8 @@ func Info(message string) {
 		fmt.Println(message)
 		return
 	}
+	mu.Lock()
+	defer mu.Unlock()
 	pterm.Info.Println(message)
 }
 
@@ -40,6 +47,8 @@ func Success(message string) {
 		fmt.Println(message)
 		return
 	}
+	mu.Lock()
+	defer mu.Unlock()
 	pterm.Success.Println(message)
 }
 
@@ -49,6 +58,8 @@ func Warn(message string) {
 		fmt.Println("WARNING:", message)
 		return
 	}
+	mu.Lock()
+	defer mu.Unlock()
 	pterm.Warning.Println(message)
 }
 
@@ -58,14 +69,133 @@ func Error(message string) {
 		fmt.Fprintln(os.Stderr, "ERROR:", message)
 		return
 	}
+	mu.Lock()
+	defer mu.Unlock()
 	pterm.Error.Println(message)
 }
 
-// Spinner creates and returns a new spinner with the given title.
-// Callers should call Start() to begin the spinner and Success()/Fail() to finish.
-func Spinner(title string) *pterm.SpinnerPrinter {
-	spinner, _ := pterm.DefaultSpinner.Start(title)
-	return spinner
+// SafeSpinner wraps *pterm.SpinnerPrinter and guards every pterm call with mu,
+// preventing races when concurrent goroutines each hold their own spinner.
+// sp is nil in no-op mode (non-interactive terminals / NO_COLOR), where all
+// methods become plain text-print operations — no pterm goroutines are spawned.
+type SafeSpinner struct {
+	sp *pterm.SpinnerPrinter
+}
+
+// IsActive reports whether the spinner is currently running.
+func (s *SafeSpinner) IsActive() bool {
+	if s.sp == nil {
+		return false
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	return s.sp.IsActive
+}
+
+// Stop stops the spinner without a status message.
+func (s *SafeSpinner) Stop() error {
+	if s.sp == nil {
+		return nil
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	return s.sp.Stop()
+}
+
+// Success stops the spinner with a success message.
+func (s *SafeSpinner) Success(msg ...interface{}) {
+	if s.sp == nil {
+		if len(msg) > 0 {
+			fmt.Println(msg...)
+		}
+		return
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	s.sp.Success(msg...)
+}
+
+// Fail stops the spinner with a failure message.
+func (s *SafeSpinner) Fail(msg ...interface{}) {
+	if s.sp == nil {
+		if len(msg) > 0 {
+			fmt.Fprintln(os.Stderr, msg...)
+		}
+		return
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	s.sp.Fail(msg...)
+}
+
+// UpdateText changes the spinner's label while it is running.
+func (s *SafeSpinner) UpdateText(text string) {
+	if s.sp == nil {
+		return
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	s.sp.UpdateText(text)
+}
+
+// MultiSpinner manages multiple concurrent spinners via pterm's MultiPrinter.
+// Create with NewMultiSpinner(n), call Start() before use, Stop() when done.
+type MultiSpinner struct {
+	multi   *pterm.MultiPrinter
+	writers []io.Writer
+	noOp    bool // true in non-TTY/NO_COLOR mode
+}
+
+func NewMultiSpinner(n int) *MultiSpinner {
+	if viper.GetBool("NO_COLOR") || !IsTerminal() {
+		return &MultiSpinner{noOp: true, writers: make([]io.Writer, n)}
+	}
+	multi := pterm.DefaultMultiPrinter
+	writers := make([]io.Writer, n)
+	for i := range writers {
+		writers[i] = multi.NewWriter()
+	}
+	return &MultiSpinner{multi: &multi, writers: writers}
+}
+
+func (m *MultiSpinner) Start() {
+	if m.noOp {
+		return
+	}
+	_, _ = m.multi.Start()
+}
+
+func (m *MultiSpinner) Stop() {
+	if m.noOp {
+		return
+	}
+	_, _ = m.multi.Stop()
+}
+
+// Spinner creates a spinner on the given slot.
+func (m *MultiSpinner) Spinner(slot int, title string) *SafeSpinner {
+	if m.noOp {
+		fmt.Println(title)
+		return &SafeSpinner{sp: nil}
+	}
+	sp, _ := pterm.DefaultSpinner.WithWriter(m.writers[slot]).Start(title)
+	return &SafeSpinner{sp: sp}
+}
+
+// Spinner creates and returns a SafeSpinner with the given title for single-spinner use.
+//
+// In non-interactive environments (no TTY or NO_COLOR set) it returns a no-op
+// spinner that prints plain text instead of spawning pterm's animation goroutine.
+// This is the correct behaviour for CI, tests, and piped output.
+func Spinner(title string) *SafeSpinner {
+	if viper.GetBool("NO_COLOR") || !IsTerminal() {
+		fmt.Println(title)
+		return &SafeSpinner{sp: nil}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	sp, _ := pterm.DefaultSpinner.Start(title)
+	return &SafeSpinner{sp: sp}
 }
 
 // Confirm prompts the user for yes/no confirmation using pterm's interactive confirm.
@@ -77,6 +207,8 @@ func Confirm(prompt string, defaultYes bool) (bool, error) {
 		return defaultYes, nil
 	}
 
+	mu.Lock()
+	defer mu.Unlock()
 	result, err := pterm.DefaultInteractiveConfirm.
 		WithDefaultValue(defaultYes).
 		Show(prompt)
@@ -109,6 +241,8 @@ func Table(headers []string, rows [][]string) {
 		return
 	}
 
+	mu.Lock()
+	defer mu.Unlock()
 	tableData := pterm.TableData{headers}
 	tableData = append(tableData, rows...)
 	_ = pterm.DefaultTable.WithHasHeader().WithData(tableData).Render()

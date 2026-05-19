@@ -19,6 +19,7 @@ import (
 	"github.com/mona-actions/gh-history-rewrite-migration/internal/atomicfs"
 	"github.com/mona-actions/gh-history-rewrite-migration/internal/output"
 	"github.com/mona-actions/gh-history-rewrite-migration/internal/workdir"
+	"golang.org/x/sync/errgroup"
 )
 
 // Mode selects how exporter obtains the two raw archives.
@@ -152,15 +153,24 @@ func (e *Exporter) loadOrInitMode(wantMode Mode) (Mode, error) {
 func (e *Exporter) runTwoMode(ctx context.Context) error {
 	base := e.baseToggles()
 	repo := e.repoSlug()
+
+	ms := output.NewMultiSpinner(2)
+	ms.Start()
+	defer ms.Stop()
+
+	g, gctx := errgroup.WithContext(ctx)
 	if !archiveComplete(e.wd.RawGitArchive()) {
-		if err := e.runMigration(ctx, api.GitOnlyMigrationOpts(repo), e.wd.RawGitArchive(), "git archive"); err != nil {
-			return err
-		}
+		g.Go(func() error {
+			return e.runMigration(gctx, ms, 0, api.GitOnlyMigrationOpts(repo), e.wd.RawGitArchive(), "git archive")
+		})
 	}
 	if !archiveComplete(e.wd.RawMetadataArchive()) {
-		if err := e.runMigration(ctx, api.MetadataOnlyMigrationOpts(repo, base), e.wd.RawMetadataArchive(), "metadata archive"); err != nil {
-			return err
-		}
+		g.Go(func() error {
+			return e.runMigration(gctx, ms, 1, api.MetadataOnlyMigrationOpts(repo, base), e.wd.RawMetadataArchive(), "metadata archive")
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return err
 	}
 	output.Success("export complete")
 	return nil
@@ -175,7 +185,10 @@ func (e *Exporter) runCombinedMode(ctx context.Context) error {
 	}
 
 	if !archiveComplete(rawCombined) {
-		if err := e.runMigration(ctx, api.CombinedMigrationOpts(e.repoSlug(), e.baseToggles()), rawCombined, "combined archive"); err != nil {
+		ms := output.NewMultiSpinner(1)
+		ms.Start()
+		defer ms.Stop()
+		if err := e.runMigration(ctx, ms, 0, api.CombinedMigrationOpts(e.repoSlug(), e.baseToggles()), rawCombined, "combined archive"); err != nil {
 			return err
 		}
 	}
@@ -225,16 +238,16 @@ func (e *Exporter) runCombinedMode(ctx context.Context) error {
 	return nil
 }
 
-func (e *Exporter) runMigration(ctx context.Context, opts api.MigrationOpts, outPath, label string) (err error) {
+func (e *Exporter) runMigration(ctx context.Context, ms *output.MultiSpinner, slot int, opts api.MigrationOpts, outPath, label string) (err error) {
 	output.Info(fmt.Sprintf("starting %s migration for %s", label, strings.Join(opts.Repositories, ",")))
 	migrationID, err := e.api.StartOrgMigration(ctx, e.cfg.Org, opts)
 	if err != nil {
 		return fmt.Errorf("failed to start migration: %w", err)
 	}
-	if err := e.pollUntilExported(ctx, migrationID, label); err != nil {
+	if err := e.pollUntilExported(ctx, ms, slot, migrationID, label); err != nil {
 		return err
 	}
-	if err := e.downloadArchive(ctx, migrationID, outPath, label); err != nil {
+	if err := e.downloadArchive(ctx, ms, slot, migrationID, outPath, label); err != nil {
 		return fmt.Errorf("failed to download %s: %w", label, err)
 	}
 	if err := atomicfs.ValidateTarHeader(outPath); err != nil {
@@ -269,10 +282,10 @@ func archiveComplete(path string) bool {
 	return atomicfs.IsFileComplete(path) && atomicfs.ValidateTarHeader(path) == nil
 }
 
-func (e *Exporter) pollUntilExported(ctx context.Context, id int64, label string) error {
-	spinner := output.Spinner(fmt.Sprintf("waiting for %s to be exported (state: pending)", label))
+func (e *Exporter) pollUntilExported(ctx context.Context, ms *output.MultiSpinner, slot int, id int64, label string) error {
+	spinner := ms.Spinner(slot, fmt.Sprintf("waiting for %s to be exported (state: pending)", label))
 	defer func() {
-		if spinner.IsActive {
+		if spinner.IsActive() {
 			_ = spinner.Stop()
 		}
 	}()
@@ -293,7 +306,7 @@ func (e *Exporter) pollUntilExported(ctx context.Context, id int64, label string
 			spinner.Fail("migration failed")
 			return fmt.Errorf("migration %d entered failed state", id)
 		default:
-			spinner.UpdateText(fmt.Sprintf("waiting for migration to be exported (state: %s)", m.State))
+			spinner.UpdateText(fmt.Sprintf("waiting for %s to be exported (state: %s)", label, m.State))
 		}
 
 		jitter := time.Duration(0)
@@ -313,8 +326,14 @@ func (e *Exporter) pollUntilExported(ctx context.Context, id int64, label string
 	}
 }
 
-func (e *Exporter) downloadArchive(ctx context.Context, id int64, outPath, label string) error {
-	spinner := output.Spinner(fmt.Sprintf("downloading %s", label))
+func (e *Exporter) downloadArchive(ctx context.Context, ms *output.MultiSpinner, slot int, id int64, outPath, label string) error {
+	spinner := ms.Spinner(slot, fmt.Sprintf("downloading %s", label))
+	defer func() {
+		// Safety net: stop spinner if an unexpected early return leaves it running.
+		if spinner.IsActive() {
+			_ = spinner.Stop()
+		}
+	}()
 	err := atomicfs.WriteFileAtomicPath(outPath, func(partialPath string) error {
 		return e.api.DownloadArchive(ctx, e.cfg.Org, id, partialPath)
 	})

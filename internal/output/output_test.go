@@ -76,6 +76,20 @@ func TestSpinner(t *testing.T) {
 	})
 }
 
+func TestMultiSpinner(t *testing.T) {
+	assert.NotPanics(t, func() {
+		ms := NewMultiSpinner(2)
+		ms.Start()
+		s0 := ms.Spinner(0, "slot 0")
+		s1 := ms.Spinner(1, "slot 1")
+		assert.NotNil(t, s0)
+		assert.NotNil(t, s1)
+		s0.Success("done 0")
+		s1.Success("done 1")
+		ms.Stop()
+	})
+}
+
 func TestConfirm_NonInteractive(t *testing.T) {
 	// When not in a terminal, Confirm should return the default without prompting
 	// We can't easily test interactive mode in unit tests

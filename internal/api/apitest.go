@@ -5,7 +5,7 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/google/go-github/v62/github"
+	"github.com/google/go-github/v86/github"
 )
 
 // NewForTesting builds an *API whose underlying github.Client points at the

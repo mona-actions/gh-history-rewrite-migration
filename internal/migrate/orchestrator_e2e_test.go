@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	commitarchive "github.com/mona-actions/gh-commit-remap/pkg/archive"
@@ -74,8 +75,16 @@ func TestOrchestratorE2E_TwoMode_RealFixture(t *testing.T) {
 	assertImportReceivedArchives(t, res.importer, res.wd)
 
 	require.Len(t, res.server.payloads, 2)
-	assert.True(t, res.server.payloads[0].ExcludeMetadata, "first two-mode export should be git-only")
-	assert.True(t, res.server.payloads[1].ExcludeGitData, "second two-mode export should be metadata-only")
+	var gitPayload, metaPayload api.MigrationOpts
+	for _, p := range res.server.payloads {
+		if p.ExcludeMetadata {
+			gitPayload = p
+		} else {
+			metaPayload = p
+		}
+	}
+	assert.True(t, gitPayload.ExcludeMetadata, "one two-mode export should be git-only")
+	assert.True(t, metaPayload.ExcludeGitData, "one two-mode export should be metadata-only")
 	assert.Equal(t, 2, res.server.downloads)
 	assert.Equal(t, 2, res.server.deletes)
 }
@@ -168,6 +177,7 @@ func runOrchestratorE2E(t *testing.T, mode exporter.Mode, archives e2eArchives, 
 }
 
 type e2eMigrationServer struct {
+	mu        sync.Mutex
 	t         *testing.T
 	server    *httptest.Server
 	archives  e2eArchives
@@ -200,9 +210,11 @@ func (s *e2eMigrationServer) handle(w http.ResponseWriter, r *http.Request) {
 	if len(parts) == 2 && parts[0] == "download" {
 		id, err := strconv.ParseInt(strings.TrimSuffix(parts[1], ".tar.gz"), 10, 64)
 		require.NoError(s.t, err)
+		s.mu.Lock()
 		archiveBytes := s.byID[id]
-		require.NotEmpty(s.t, archiveBytes)
 		s.downloads++
+		s.mu.Unlock()
+		require.NotEmpty(s.t, archiveBytes)
 		w.Header().Set("Content-Type", "application/octet-stream")
 		_, _ = w.Write(archiveBytes)
 		return
@@ -215,12 +227,15 @@ func (s *e2eMigrationServer) handleMigration(w http.ResponseWriter, r *http.Requ
 	case len(parts) == 3 && r.Method == http.MethodPost:
 		var opts api.MigrationOpts
 		require.NoError(s.t, json.NewDecoder(r.Body).Decode(&opts))
+		s.mu.Lock()
 		s.payloads = append(s.payloads, opts)
 		s.nextID++
-		s.byID[s.nextID] = s.archiveFor(opts)
+		id := s.nextID
+		s.byID[id] = s.archiveFor(opts)
+		s.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
-		fmt.Fprintf(w, `{"id":%d,"state":"pending"}`, s.nextID)
+		fmt.Fprintf(w, `{"id":%d,"state":"pending"}`, id)
 	case len(parts) == 4 && r.Method == http.MethodGet:
 		id, err := strconv.ParseInt(parts[3], 10, 64)
 		require.NoError(s.t, err)
@@ -229,7 +244,9 @@ func (s *e2eMigrationServer) handleMigration(w http.ResponseWriter, r *http.Requ
 	case len(parts) == 5 && parts[4] == "archive" && r.Method == http.MethodGet:
 		http.Redirect(w, r, s.server.URL+"/download/"+parts[3]+".tar.gz", http.StatusFound)
 	case len(parts) == 5 && parts[4] == "archive" && r.Method == http.MethodDelete:
+		s.mu.Lock()
 		s.deletes++
+		s.mu.Unlock()
 		w.WriteHeader(http.StatusNoContent)
 	default:
 		http.NotFound(w, r)

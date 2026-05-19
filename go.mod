@@ -4,7 +4,7 @@ go 1.25.5
 
 require (
 	github.com/gofri/go-github-ratelimit v1.1.1
-	github.com/google/go-github/v62 v62.0.0
+	github.com/google/go-github/v86 v86.0.0
 	github.com/mona-actions/gh-commit-remap v0.1.0
 	github.com/pterm/pterm v0.12.83
 	github.com/shurcooL/githubv4 v0.0.0-20260209031235-2402fdf4a9ed
@@ -12,6 +12,7 @@ require (
 	github.com/spf13/viper v1.19.0
 	github.com/stretchr/testify v1.9.0
 	golang.org/x/oauth2 v0.36.0
+	golang.org/x/sync v0.20.0
 	golang.org/x/term v0.42.0
 )
 

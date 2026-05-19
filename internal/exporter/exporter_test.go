@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -21,12 +22,14 @@ import (
 
 	commitarchive "github.com/mona-actions/gh-commit-remap/pkg/archive"
 	"github.com/mona-actions/gh-history-rewrite-migration/internal/api"
+	"github.com/mona-actions/gh-history-rewrite-migration/internal/output"
 	"github.com/mona-actions/gh-history-rewrite-migration/internal/workdir"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 type fakeAPI struct {
+	mu           sync.Mutex
 	pollSequence []string
 	archiveBytes [][]byte
 	startErr     error
@@ -41,7 +44,9 @@ type fakeAPI struct {
 
 func (f *fakeAPI) StartOrgMigration(_ context.Context, _ string, opts api.MigrationOpts) (int64, error) {
 	n := atomic.AddInt32(&f.startCalled, 1)
+	f.mu.Lock()
 	f.opts = append(f.opts, opts)
+	f.mu.Unlock()
 	if f.startErr != nil {
 		return 0, f.startErr
 	}
@@ -135,19 +140,28 @@ func TestExporterRunTwoModeHappyPath(t *testing.T) {
 	assert.Equal(t, int32(2), atomic.LoadInt32(&fake.downloadCalled))
 	assert.Equal(t, int32(2), atomic.LoadInt32(&fake.deleteCalled))
 	require.Len(t, fake.opts, 2)
-	assert.True(t, fake.opts[0].ExcludeMetadata)
-	assert.False(t, fake.opts[0].ExcludeGitData)
-	assert.True(t, fake.opts[1].ExcludeGitData)
-	assert.True(t, fake.opts[1].ExcludeOwnerProjects)
-	assert.True(t, fake.opts[1].ExcludeReleases)
-	assert.True(t, fake.opts[1].ExcludeAttachments)
-	assert.True(t, fake.opts[1].LockRepositories)
+	var gitOpts, metaOpts api.MigrationOpts
+	for _, o := range fake.opts {
+		if o.ExcludeMetadata {
+			gitOpts = o
+		} else {
+			metaOpts = o
+		}
+	}
+	assert.True(t, gitOpts.ExcludeMetadata)
+	assert.False(t, gitOpts.ExcludeGitData)
+	assert.True(t, metaOpts.ExcludeGitData)
+	assert.True(t, metaOpts.ExcludeOwnerProjects)
+	assert.True(t, metaOpts.ExcludeReleases)
+	assert.True(t, metaOpts.ExcludeAttachments)
+	assert.True(t, metaOpts.LockRepositories)
 	assert.FileExists(t, wd.RawGitArchive())
 	assert.FileExists(t, wd.RawMetadataArchive())
 }
 
 func TestExporterRunTwoModeHTTPPayloadsAndCleanup(t *testing.T) {
 	archiveBytes := buildTarGz(t, map[string][]byte{"schema.json": []byte("{}")})
+	var mu sync.Mutex
 	var posts []map[string]any
 	deleted := map[string]bool{}
 
@@ -158,10 +172,13 @@ func TestExporterRunTwoModeHTTPPayloadsAndCleanup(t *testing.T) {
 			require.Equal(t, http.MethodPost, r.Method)
 			var payload map[string]any
 			require.NoError(t, json.NewDecoder(r.Body).Decode(&payload))
+			mu.Lock()
 			posts = append(posts, payload)
+			postLen := len(posts)
+			mu.Unlock()
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusCreated)
-			fmt.Fprintf(w, `{"id":%d,"state":"pending"}`, len(posts))
+			fmt.Fprintf(w, `{"id":%d,"state":"pending"}`, postLen)
 		case strings.HasPrefix(r.URL.Path, "/orgs/acme/migrations/"):
 			rel := strings.TrimPrefix(r.URL.Path, "/orgs/acme/migrations/")
 			parts := strings.Split(strings.Trim(rel, "/"), "/")
@@ -174,7 +191,9 @@ func TestExporterRunTwoModeHTTPPayloadsAndCleanup(t *testing.T) {
 			case r.Method == http.MethodGet && len(parts) == 2 && parts[1] == "archive":
 				http.Redirect(w, r, srv.URL+"/download/"+id+".tar.gz", http.StatusFound)
 			case r.Method == http.MethodDelete && len(parts) == 2 && parts[1] == "archive":
+				mu.Lock()
 				deleted[id] = true
+				mu.Unlock()
 				w.WriteHeader(http.StatusNoContent)
 			default:
 				http.NotFound(w, r)
@@ -197,10 +216,18 @@ func TestExporterRunTwoModeHTTPPayloadsAndCleanup(t *testing.T) {
 	require.NoError(t, exp.Run(context.Background()))
 
 	require.Len(t, posts, 2)
-	assert.Equal(t, true, posts[0]["exclude_metadata"])
-	assert.NotContains(t, posts[0], "exclude_git_data")
-	assert.Equal(t, true, posts[1]["exclude_git_data"])
-	assert.NotContains(t, posts[1], "exclude_metadata")
+	var gitPost, metaPost map[string]any
+	for _, p := range posts {
+		if _, ok := p["exclude_metadata"]; ok {
+			gitPost = p
+		} else {
+			metaPost = p
+		}
+	}
+	assert.Equal(t, true, gitPost["exclude_metadata"])
+	assert.NotContains(t, gitPost, "exclude_git_data")
+	assert.Equal(t, true, metaPost["exclude_git_data"])
+	assert.NotContains(t, metaPost, "exclude_metadata")
 	assert.FileExists(t, wd.RawGitArchive())
 	assert.FileExists(t, wd.RawMetadataArchive())
 	assert.True(t, deleted["1"], "expected first migration archive to be deleted")
@@ -266,7 +293,10 @@ func TestExporterRunFailedStateKeepsRemote(t *testing.T) {
 func TestExporterRunMigrationDownloadErrorKeepsRemote(t *testing.T) {
 	fake := &fakeAPI{pollSequence: []string{"exported"}, downloadErr: errors.New("boom")}
 	exp, wd := newTestExporter(t, fake, Config{})
-	err := exp.runMigration(context.Background(), api.MigrationOpts{Repositories: []string{"widget"}}, wd.RawGitArchive(), "git archive")
+	ms := output.NewMultiSpinner(1)
+	ms.Start()
+	defer ms.Stop()
+	err := exp.runMigration(context.Background(), ms, 0, api.MigrationOpts{Repositories: []string{"widget"}}, wd.RawGitArchive(), "git archive")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to download git archive")
 	assert.Equal(t, int32(0), atomic.LoadInt32(&fake.deleteCalled))
@@ -275,7 +305,10 @@ func TestExporterRunMigrationDownloadErrorKeepsRemote(t *testing.T) {
 func TestExporterRunMigrationValidationErrorKeepsRemote(t *testing.T) {
 	fake := &fakeAPI{pollSequence: []string{"exported"}, archiveBytes: [][]byte{[]byte("not a tarball")}}
 	exp, wd := newTestExporter(t, fake, Config{})
-	err := exp.runMigration(context.Background(), api.MigrationOpts{Repositories: []string{"widget"}}, wd.RawGitArchive(), "git archive")
+	ms := output.NewMultiSpinner(1)
+	ms.Start()
+	defer ms.Stop()
+	err := exp.runMigration(context.Background(), ms, 0, api.MigrationOpts{Repositories: []string{"widget"}}, wd.RawGitArchive(), "git archive")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "downloaded archive failed validation")
 	assert.Equal(t, int32(0), atomic.LoadInt32(&fake.deleteCalled))
@@ -418,6 +451,54 @@ func TestSplitTreeBareRepoMustBeUnderRepositories(t *testing.T) {
 	err := splitTree(extractRoot, filepath.Join(extractRoot, "foo.git"), filepath.Join(t.TempDir(), "git"), filepath.Join(t.TempDir(), "meta"))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not under repositories")
+}
+
+// barrierAPI wraps fakeAPI and injects a WaitGroup barrier into StartOrgMigration
+// so both goroutines must arrive before either can proceed.
+type barrierAPI struct {
+	*fakeAPI
+	barrier *sync.WaitGroup
+}
+
+func (b *barrierAPI) StartOrgMigration(ctx context.Context, org string, opts api.MigrationOpts) (int64, error) {
+	b.barrier.Done() // signal arrival
+	b.barrier.Wait() // wait for the peer goroutine to arrive too
+	return b.fakeAPI.StartOrgMigration(ctx, org, opts)
+}
+
+// TestExporterRunTwoModeRunsInParallel proves the two migrations in runTwoMode
+// are launched concurrently. The WaitGroup barrier blocks each goroutine inside
+// StartOrgMigration until both have arrived. Sequential execution would deadlock
+// (first blocks forever, second never starts), so a timeout → test failure is the
+// meaningful signal here.
+func TestExporterRunTwoModeRunsInParallel(t *testing.T) {
+	var barrier sync.WaitGroup
+	barrier.Add(2)
+
+	gitArchive := buildTarGz(t, map[string][]byte{"repositories/Acme/widget.git/HEAD": []byte("ref: refs/heads/main\n")})
+	metaArchive := buildTarGz(t, map[string][]byte{"issues_000001.json": []byte("[]"), "schema.json": []byte("{}")})
+	base := &fakeAPI{
+		pollSequence: []string{"exported"},
+		archiveBytes: [][]byte{gitArchive, metaArchive},
+	}
+
+	barrierFake := &barrierAPI{fakeAPI: base, barrier: &barrier}
+	wd, err := workdir.New(t.TempDir())
+	require.NoError(t, err)
+	exp := &Exporter{
+		api:         barrierFake,
+		wd:          wd,
+		cfg:         Config{Org: "acme", Repo: "widget", Mode: ModeTwo},
+		pollInitial: time.Millisecond,
+		pollMax:     2 * time.Millisecond,
+		now:         time.Now,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	require.NoError(t, exp.Run(ctx), "expected parallel run to complete without deadlock")
+	assert.Equal(t, int32(2), atomic.LoadInt32(&base.startCalled))
 }
 
 func TestIsCrossDeviceDetectsEXDEV(t *testing.T) {
