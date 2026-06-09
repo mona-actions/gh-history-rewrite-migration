@@ -129,7 +129,7 @@ func TestCallbackKindFor_PathPrefix(t *testing.T) {
 	assert.Equal(t, "--email-callback", got)
 }
 
-func TestRunCombined_AssemblesSingleInvocation(t *testing.T) {
+func TestRun_AssemblesSingleInvocation(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "fixmail.email-callback.py")
 	const body = "# secret-looking content"
@@ -137,7 +137,7 @@ func TestRunCombined_AssemblesSingleInvocation(t *testing.T) {
 
 	exec := &fakeExecer{}
 	r := New(exec, nil)
-	err := r.RunCombined(context.Background(), dir, CombinedOpts{
+	err := r.Run(context.Background(), dir, CombinedOpts{
 		StripActive:      true,
 		PathsFromFile:    "/tmp/cleanup.txt",
 		ScriptPaths:      []string{script},
@@ -154,10 +154,10 @@ func TestRunCombined_AssemblesSingleInvocation(t *testing.T) {
 	}, args)
 }
 
-func TestRunCombined_StripOnly(t *testing.T) {
+func TestRun_StripOnly(t *testing.T) {
 	exec := &fakeExecer{}
 	r := New(exec, nil)
-	err := r.RunCombined(context.Background(), "/tmp/repo.git", CombinedOpts{
+	err := r.Run(context.Background(), "/tmp/repo.git", CombinedOpts{
 		StripActive:   true,
 		PathsFromFile: "/tmp/cleanup.txt",
 	})
@@ -168,10 +168,10 @@ func TestRunCombined_StripOnly(t *testing.T) {
 	}, exec.calls[0])
 }
 
-func TestRunCombined_FlagsOnly(t *testing.T) {
+func TestRun_FlagsOnly(t *testing.T) {
 	exec := &fakeExecer{}
 	r := New(exec, nil)
-	err := r.RunCombined(context.Background(), "/tmp", CombinedOpts{
+	err := r.Run(context.Background(), "/tmp", CombinedOpts{
 		PassthroughFlags: []string{"--refs", "main"},
 	})
 	require.NoError(t, err)
@@ -179,10 +179,10 @@ func TestRunCombined_FlagsOnly(t *testing.T) {
 	assert.Equal(t, []string{"git", "filter-repo", "--force", "--refs", "main"}, exec.calls[0])
 }
 
-func TestRunCombined_RejectsReservedFlag(t *testing.T) {
+func TestRun_RejectsReservedFlag(t *testing.T) {
 	exec := &fakeExecer{}
 	r := New(exec, nil)
-	err := r.RunCombined(context.Background(), "/tmp", CombinedOpts{
+	err := r.Run(context.Background(), "/tmp", CombinedOpts{
 		PassthroughFlags: []string{"--force"},
 	})
 	require.Error(t, err)
@@ -190,10 +190,10 @@ func TestRunCombined_RejectsReservedFlag(t *testing.T) {
 	assert.Empty(t, exec.calls)
 }
 
-func TestRunCombined_RejectsStripBlockedPathFamily(t *testing.T) {
+func TestRun_RejectsStripBlockedPathFamily(t *testing.T) {
 	exec := &fakeExecer{}
 	r := New(exec, nil)
-	err := r.RunCombined(context.Background(), "/tmp", CombinedOpts{
+	err := r.Run(context.Background(), "/tmp", CombinedOpts{
 		StripActive:      true,
 		PathsFromFile:    "/tmp/cleanup.txt",
 		PassthroughFlags: []string{"--invert-paths"},
@@ -203,20 +203,20 @@ func TestRunCombined_RejectsStripBlockedPathFamily(t *testing.T) {
 	assert.Empty(t, exec.calls)
 }
 
-func TestRunCombined_UnknownSuffix(t *testing.T) {
+func TestRun_UnknownSuffix(t *testing.T) {
 	dir := t.TempDir()
 	bad := filepath.Join(dir, "noop.py")
 	require.NoError(t, os.WriteFile(bad, []byte(""), 0o644))
 
 	exec := &fakeExecer{}
 	r := New(exec, nil)
-	err := r.RunCombined(context.Background(), dir, CombinedOpts{ScriptPaths: []string{bad}})
+	err := r.Run(context.Background(), dir, CombinedOpts{ScriptPaths: []string{bad}})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unknown callback kind")
 	assert.Empty(t, exec.calls)
 }
 
-func TestRunCombined_DuplicateKindAcrossScripts(t *testing.T) {
+func TestRun_DuplicateKindAcrossScripts(t *testing.T) {
 	dir := t.TempDir()
 	a := filepath.Join(dir, "a.commit-callback.py")
 	b := filepath.Join(dir, "b.commit-callback.py")
@@ -225,20 +225,20 @@ func TestRunCombined_DuplicateKindAcrossScripts(t *testing.T) {
 
 	exec := &fakeExecer{}
 	r := New(exec, nil)
-	err := r.RunCombined(context.Background(), dir, CombinedOpts{ScriptPaths: []string{a, b}})
+	err := r.Run(context.Background(), dir, CombinedOpts{ScriptPaths: []string{a, b}})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "duplicate")
 	assert.Empty(t, exec.calls)
 }
 
-func TestRunCombined_DuplicateKindAcrossScriptAndFlag(t *testing.T) {
+func TestRun_DuplicateKindAcrossScriptAndFlag(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "a.commit-callback.py")
 	require.NoError(t, os.WriteFile(script, []byte("# a"), 0o644))
 
 	exec := &fakeExecer{}
 	r := New(exec, nil)
-	err := r.RunCombined(context.Background(), dir, CombinedOpts{
+	err := r.Run(context.Background(), dir, CombinedOpts{
 		ScriptPaths:      []string{script},
 		PassthroughFlags: []string{"--commit-callback=return commit"},
 	})
@@ -248,7 +248,7 @@ func TestRunCombined_DuplicateKindAcrossScriptAndFlag(t *testing.T) {
 	assert.Empty(t, exec.calls)
 }
 
-func TestRunCombined_NeverLogsBody(t *testing.T) {
+func TestRun_NeverLogsBody(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "x.commit-callback.py")
 	const secretBody = "TOTALLY-SECRET-CALLBACK-BODY"
@@ -256,7 +256,7 @@ func TestRunCombined_NeverLogsBody(t *testing.T) {
 
 	rec := &recordingLogger{}
 	r := New(&fakeExecer{}, rec)
-	err := r.RunCombined(context.Background(), dir, CombinedOpts{ScriptPaths: []string{script}})
+	err := r.Run(context.Background(), dir, CombinedOpts{ScriptPaths: []string{script}})
 	require.NoError(t, err)
 
 	for _, msg := range rec.msgs {
@@ -265,19 +265,19 @@ func TestRunCombined_NeverLogsBody(t *testing.T) {
 	}
 }
 
-func TestRunCombined_PropagatesExecError(t *testing.T) {
+func TestRun_PropagatesExecError(t *testing.T) {
 	r := New(&fakeExecer{runErr: errors.New("boom")}, nil)
-	err := r.RunCombined(context.Background(), "/tmp", CombinedOpts{
+	err := r.Run(context.Background(), "/tmp", CombinedOpts{
 		PassthroughFlags: []string{"--refs", "main"},
 	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "boom")
 }
 
-func TestRunCombined_MissingScriptErrors(t *testing.T) {
+func TestRun_MissingScriptErrors(t *testing.T) {
 	exec := &fakeExecer{}
 	r := New(exec, nil)
-	err := r.RunCombined(context.Background(), "/tmp", CombinedOpts{
+	err := r.Run(context.Background(), "/tmp", CombinedOpts{
 		ScriptPaths: []string{filepath.Join(t.TempDir(), "missing.commit-callback.py")},
 	})
 	require.Error(t, err)

@@ -401,50 +401,30 @@ func redactForLog(args []string) string {
 	return strings.Join(out, " ")
 }
 
-// CombinedOpts configures a single, unified mutating filter-repo
-// invocation that folds the large-file strip, user callback scripts, and
-// passthrough flags into one pass. Running them together guarantees
-// exactly one commit-map is produced mapping original SHAs to final SHAs;
-// separate sequential passes would each emit (and overwrite) a commit-map,
-// leaving only an intermediate→final mapping on disk.
+// CombinedOpts folds the strip, callback scripts, and passthrough flags
+// into one filter-repo pass so exactly one original→final commit-map results.
 type CombinedOpts struct {
-	// StripActive reflects the operator's --strip-large-files intent. It
-	// drives the strip-blocked path-selection validation independently of
-	// whether any paths were ultimately flagged, so the guard agrees with
-	// the orchestrator's early fail-fast check even when nothing exceeds
-	// the threshold. It is an explicit input, never re-derived from
-	// PathsFromFile.
+	// StripActive is the --strip-large-files intent; drives path-selection
+	// validation even when no paths are flagged. Never derived from PathsFromFile.
 	StripActive bool
-	// PathsFromFile, when non-empty, adds --invert-paths --paths-from-file
-	// <PathsFromFile> to the invocation. It is only set when a strip was
-	// requested AND at least one path was flagged.
+	// PathsFromFile adds --invert-paths --paths-from-file; set only when a
+	// strip was requested AND at least one path was flagged.
 	PathsFromFile string
-	// ScriptPaths are user callback scripts dispatched by filename suffix
-	// (see CallbackKindFor). Bodies are read and attached as flag/body
-	// pairs; contents are never logged.
+	// ScriptPaths are callback scripts dispatched by filename suffix;
+	// bodies are attached as flag/body pairs and never logged.
 	ScriptPaths []string
-	// PassthroughFlags are raw filter-repo argv tokens supplied via
-	// --filter-repo-flag. They are validated via ValidateUserFlags.
+	// PassthroughFlags are raw filter-repo tokens from --filter-repo-flag,
+	// validated via ValidateUserFlags.
 	PassthroughFlags []string
 
-	// Future extension seam: an optional pre-built input stream (e.g. a
-	// `git fast-export | <script> | …` pipeline) could be added here as an
-	// io.Reader alongside a --stdin mode. Doing so will also require
-	// extending the Execer interface to accept an stdin reader; CombinedOpts
-	// itself can grow that field without reworking existing callers.
+	// Extension seam: a future --stdin mode (e.g. fast-export | script | …)
+	// can add an io.Reader here without reworking existing callers.
 }
 
-// RunCombined executes a single `git filter-repo` invocation from inside
-// bareRepoPath that combines the optional large-file strip, any callback
-// scripts, and passthrough flags. Exactly one filter-repo process runs, so
-// exactly one commit-map (original→final) is produced.
-//
-// Validation mirrors the standalone helpers it replaces: passthrough flags
-// are checked via ValidateUserFlags(opts.PassthroughFlags, opts.StripActive);
-// callback kinds are dispatched by filename suffix with unknown suffixes and
-// duplicate kinds rejected — including a kind supplied BOTH via a passthrough
-// --*-callback flag AND a script. Script bodies are never logged.
-func (r *Runner) RunCombined(ctx context.Context, bareRepoPath string, opts CombinedOpts) error {
+// Run executes one `git filter-repo` combining strip, callback scripts, and
+// passthrough flags, yielding a single original→final commit-map. Validation
+// matches the helpers it replaces; script bodies are never logged.
+func (r *Runner) Run(ctx context.Context, bareRepoPath string, opts CombinedOpts) error {
 	if err := ValidateUserFlags(opts.PassthroughFlags, opts.StripActive); err != nil {
 		return err
 	}

@@ -81,9 +81,9 @@ type Result struct {
 // runnerIface is the minimal subset of *filterrepo.Runner the rewriter
 // uses. Defining it locally lets tests inject a stub without touching
 // filterrepo internals. All mutating filter-repo work flows through a
-// single RunCombined call so exactly one commit-map is produced.
+// single Run call so exactly one commit-map is produced.
 type runnerIface interface {
-	RunCombined(ctx context.Context, bareRepoPath string, opts filterrepo.CombinedOpts) error
+	Run(ctx context.Context, bareRepoPath string, opts filterrepo.CombinedOpts) error
 }
 
 // analyzerIface is the minimal subset of *largefiles.Analyzer the
@@ -220,7 +220,7 @@ func (r *Rewriter) Run(ctx context.Context, inputs ...Input) (*Result, error) {
 			ScriptPaths:      r.cfg.FilterRepoScripts,
 			PassthroughFlags: r.cfg.FilterRepoFlags,
 		}
-		if err := r.runner.RunCombined(ctx, bareRepoPath, opts); err != nil {
+		if err := r.runner.Run(ctx, bareRepoPath, opts); err != nil {
 			return nil, fmt.Errorf("filter-repo rewrite: %w", err)
 		}
 		if pathsFromFile != "" {
@@ -331,10 +331,10 @@ func wrapFindBareRepoError(root string, err error) error {
 // prepareStrip runs the read-only large-file analysis, writes cleanup.txt,
 // prints the flagged table, and performs the Gate-1 confirmation. It does
 // NOT execute filter-repo — the actual strip is folded into the single
-// RunCombined invocation. It populates the strip-related Result fields
+// Run invocation. It populates the strip-related Result fields
 // (paths, bytes) but leaves StripPerformed for the caller to set only after
 // the unified rewrite succeeds. Returns true when there are flagged paths to
-// strip (i.e. cleanup.txt is ready to feed RunCombined).
+// strip (i.e. cleanup.txt is ready to feed Run).
 func (r *Rewriter) prepareStrip(ctx context.Context, bareRepoPath string, result *Result) (bool, error) {
 	report, err := r.analyzer.Analyze(ctx, bareRepoPath)
 	if err != nil {
@@ -384,7 +384,7 @@ func (r *Rewriter) prepareStrip(ctx context.Context, bareRepoPath string, result
 func (r *Rewriter) validateScripts() error {
 	// Seed seen-kinds from passthrough callback flags so a kind supplied
 	// both via a --filter-repo-script and a --filter-repo-flag is caught
-	// early (before analyze/Gate-1), matching RunCombined's guard.
+	// early (before analyze/Gate-1), matching Run's guard.
 	seen := map[string]string{}
 	for _, raw := range r.cfg.FilterRepoFlags {
 		name := raw

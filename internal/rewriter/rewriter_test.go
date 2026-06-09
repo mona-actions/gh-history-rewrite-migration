@@ -30,7 +30,7 @@ type stubRunner struct {
 	combinedErr error
 }
 
-func (s *stubRunner) RunCombined(_ context.Context, bare string, opts filterrepo.CombinedOpts) error {
+func (s *stubRunner) Run(_ context.Context, bare string, opts filterrepo.CombinedOpts) error {
 	s.combinedCalls = append(s.combinedCalls, opts)
 	if s.combinedErr != nil {
 		return s.combinedErr
