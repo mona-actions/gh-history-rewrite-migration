@@ -80,7 +80,7 @@ type Result struct {
 
 // runnerIface is the minimal subset of *filterrepo.Runner the rewriter
 // uses. Defining it locally lets tests inject a stub without touching
-// filterrepo internals. All mutating filter-repo work flows through a
+// filterrepo internals. All mutating filter-repo work goes through a
 // single Run call so exactly one commit-map is produced.
 type runnerIface interface {
 	Run(ctx context.Context, bareRepoPath string, opts filterrepo.CombinedOpts) error
@@ -397,8 +397,12 @@ func (r *Rewriter) validateScripts() error {
 		if other, dup := seen[kind]; dup {
 			return fmt.Errorf("duplicate %s callback: %s and %s", kind, other, p)
 		}
-		if _, err := os.Stat(p); err != nil {
+		info, err := os.Lstat(p)
+		if err != nil {
 			return fmt.Errorf("callback script %s: %w", p, err)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("callback script %s: not a regular file", p)
 		}
 		seen[kind] = p
 	}
