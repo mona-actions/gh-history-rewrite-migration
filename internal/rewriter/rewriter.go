@@ -240,7 +240,13 @@ func (r *Rewriter) Run(ctx context.Context, inputs ...Input) (*Result, error) {
 		r.warn(w)
 	}
 
-	if rewriteRan {
+	// Hand off the commit-map whenever filter-repo produced one — or the
+	// source already carries one (e.g. an empty map for a no-rewrite repo)
+	// — so the downstream remap can run. A pure no-op with no source map
+	// produces none, and we stay silent rather than warn misleadingly.
+	srcInfo, srcErr := os.Stat(bareCommitMap)
+	srcCommitMap := srcErr == nil && !srcInfo.IsDir()
+	if srcCommitMap || rewriteRan {
 		if w := r.handoffCommitMap(bareCommitMap); w != "" {
 			result.Warnings = append(result.Warnings, w)
 			r.warn(w)

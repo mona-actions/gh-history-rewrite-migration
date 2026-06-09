@@ -168,6 +168,36 @@ func TestRun_StripZeroFlagged_NoStripStillArchives(t *testing.T) {
 	assert.Equal(t, 0, res.CommitsRemapped)
 }
 
+func TestRun_NoRewriteButSourceCommitMap_HandedOff(t *testing.T) {
+	// Regression: with no rewrite (empty config) the extracted repo may
+	// still carry a commit-map (e.g. an empty one). It must be handed off
+	// so the downstream remap runs — not skipped just because rewriteRan
+	// is false.
+	wd, err := workdir.New(t.TempDir())
+	require.NoError(t, err)
+	srcRoot := t.TempDir()
+	bare := filepath.Join(srcRoot, "repositories", "Acme", "foo.git")
+	createBareRepoWithCommit(t, bare)
+	require.NoError(t, os.MkdirAll(filepath.Join(bare, "filter-repo"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(bare, "filter-repo", "commit-map"), nil, 0o644))
+	writeTarGz(t, srcRoot, wd.RawGitArchive())
+
+	runner := &stubRunner{}
+	r := makeRewriter(wd, runner, &stubAnalyzer{}, Config{}, false, false)
+
+	res, err := r.Run(context.Background())
+	require.NoError(t, err)
+	require.NotNil(t, res)
+	assert.Empty(t, runner.combinedCalls, "no rewrite should run for empty config")
+	assert.FileExists(t, wd.CommitMap(), "existing source commit-map must be handed off")
+	info, err := os.Stat(wd.CommitMap())
+	require.NoError(t, err)
+	assert.Zero(t, info.Size(), "empty source commit-map stays empty after handoff")
+	for _, w := range res.Warnings {
+		assert.NotContains(t, w, "no commit-map produced")
+	}
+}
+
 func TestRun_NonTTYWithoutYes_Errors(t *testing.T) {
 	wd := newArchiveWorkDir(t, "foo.git")
 	analyzer := &stubAnalyzer{report: &largefiles.Report{
