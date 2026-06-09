@@ -160,6 +160,12 @@ func TestRun_StripZeroFlagged_NoStripStillArchives(t *testing.T) {
 	assert.False(t, res.StripPerformed)
 	assert.Empty(t, runner.combinedCalls)
 	assert.FileExists(t, wd.GitArchive())
+	// No rewrite happened, so there is no commit-map; the run must not emit
+	// the "remap will be unable to translate SHAs" warning.
+	for _, w := range res.Warnings {
+		assert.NotContains(t, w, "no commit-map produced")
+	}
+	assert.Equal(t, 0, res.CommitsRemapped)
 }
 
 func TestRun_NonTTYWithoutYes_Errors(t *testing.T) {
@@ -358,6 +364,12 @@ func TestSanitizeUserFlags_RedactsCallbackBodies(t *testing.T) {
 	in := []string{"--commit-callback=secret-body", "--refs", "main", "--message-callback=other-body", "--no-value-flag"}
 	got := sanitizeUserFlags(in)
 	assert.Equal(t, []string{"--commit-callback=<redacted>", "--refs", "main", "--message-callback=<redacted>", "--no-value-flag"}, got)
+}
+
+func TestSanitizeUserFlags_RedactsTwoTokenCallbackBody(t *testing.T) {
+	in := []string{"--commit-callback", "return commit", "--refs", "main"}
+	got := sanitizeUserFlags(in)
+	assert.Equal(t, []string{"--commit-callback", "<redacted>", "--refs", "main"}, got)
 }
 
 func TestResultRender_PrintsKeyFields(t *testing.T) {

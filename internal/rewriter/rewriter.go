@@ -243,13 +243,15 @@ func (r *Rewriter) Run(ctx context.Context, inputs ...Input) (*Result, error) {
 		r.warn(w)
 	}
 
-	if w := r.handoffCommitMap(bareCommitMap); w != "" {
-		result.Warnings = append(result.Warnings, w)
-		r.warn(w)
-	}
-	if r.wd.HasCommitMap() {
-		if n, err := filterrepo.CountCommitsRemapped(r.wd.CommitMap()); err == nil {
-			result.CommitsRemapped = n
+	if rewriteRan {
+		if w := r.handoffCommitMap(bareCommitMap); w != "" {
+			result.Warnings = append(result.Warnings, w)
+			r.warn(w)
+		}
+		if r.wd.HasCommitMap() {
+			if n, err := filterrepo.CountCommitsRemapped(r.wd.CommitMap()); err == nil {
+				result.CommitsRemapped = n
+			}
 		}
 	}
 
@@ -467,12 +469,25 @@ func (r *Rewriter) handoffCommitMap(srcCommitMap string) string {
 
 // sanitizeUserFlags returns the argv tokens with any embedded callback
 // body redacted. We never log or surface user-supplied script bodies.
+// Both forms are handled: the inline "--x-callback=<body>" and the
+// two-token "--x-callback <body>" (where the body is the following token).
 func sanitizeUserFlags(flags []string) []string {
 	out := make([]string, 0, len(flags))
+	skipNext := false
 	for _, t := range flags {
+		if skipNext {
+			out = append(out, "<redacted>")
+			skipNext = false
+			continue
+		}
+		if strings.HasPrefix(t, "--") && strings.HasSuffix(t, "-callback") {
+			out = append(out, t)
+			skipNext = true
+			continue
+		}
 		if i := strings.IndexByte(t, '='); i >= 0 {
 			name := t[:i]
-			if strings.HasSuffix(name, "-callback") {
+			if strings.HasPrefix(name, "--") && strings.HasSuffix(name, "-callback") {
 				out = append(out, name+"=<redacted>")
 				continue
 			}

@@ -387,7 +387,7 @@ func redactForLog(args []string) string {
 			skipNext = false
 			continue
 		}
-		if strings.HasSuffix(a, "-callback") {
+		if strings.HasPrefix(a, "--") && strings.HasSuffix(a, "-callback") {
 			out = append(out, a)
 			skipNext = true
 			continue
