@@ -10,6 +10,13 @@ Both flags are repeatable and compose with `--strip-large-files` —
 when all three are in play, the orchestrator builds a **single**
 filter-repo invocation so commit SHAs are rewritten exactly once.
 
+> **Note:** because the strip and your callbacks now run in the *same*
+> filter-repo pass, a `--blob-callback` / `--filename-callback` cannot
+> assume the large files were already removed by an earlier pass; path
+> filtering and callbacks are applied together within one rewrite. The
+> argument order of independent options does not change filter-repo's
+> behavior.
+
 ---
 
 ## How a script's "kind" is decided

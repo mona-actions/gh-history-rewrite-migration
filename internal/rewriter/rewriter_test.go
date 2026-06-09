@@ -16,44 +16,24 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/mona-actions/gh-history-rewrite-migration/internal/filterrepo"
 	"github.com/mona-actions/gh-history-rewrite-migration/internal/largefiles"
 	"github.com/mona-actions/gh-history-rewrite-migration/internal/workdir"
 )
 
-// stubRunner records calls and emulates filter-repo writing a commit-map.
+// stubRunner records the single combined call and emulates filter-repo
+// writing one commit-map.
 type stubRunner struct {
-	stripCalls    [][2]string
-	callbackCalls [][]string
-	runCalls      [][]string
-	order         []string
+	combinedCalls []filterrepo.CombinedOpts
 	writeCount    int
 
-	stripErr    error
-	callbackErr error
-	runErr      error
+	combinedErr error
 }
 
-func (s *stubRunner) StripPaths(_ context.Context, bare, paths string) error {
-	s.order = append(s.order, "strip")
-	s.stripCalls = append(s.stripCalls, [2]string{bare, paths})
-	if s.stripErr != nil {
-		return s.stripErr
-	}
-	return s.writeCommitMap(bare)
-}
-func (s *stubRunner) RunCallbackScripts(_ context.Context, bare string, scripts []string) error {
-	s.order = append(s.order, "callbacks")
-	s.callbackCalls = append(s.callbackCalls, append([]string(nil), scripts...))
-	if s.callbackErr != nil {
-		return s.callbackErr
-	}
-	return s.writeCommitMap(bare)
-}
-func (s *stubRunner) Run(_ context.Context, bare string, args []string) error {
-	s.order = append(s.order, "run")
-	s.runCalls = append(s.runCalls, append([]string(nil), args...))
-	if s.runErr != nil {
-		return s.runErr
+func (s *stubRunner) RunCombined(_ context.Context, bare string, opts filterrepo.CombinedOpts) error {
+	s.combinedCalls = append(s.combinedCalls, opts)
+	if s.combinedErr != nil {
+		return s.combinedErr
 	}
 	return s.writeCommitMap(bare)
 }
@@ -94,7 +74,7 @@ func TestRun_ModeUnawareProducesArchiveAndCommitMap(t *testing.T) {
 	require.NotNil(t, res)
 	assert.FileExists(t, wd.GitArchive())
 	assert.FileExists(t, wd.CommitMap())
-	assert.Equal(t, 1, len(runner.runCalls))
+	assert.Equal(t, 1, len(runner.combinedCalls))
 	assert.Equal(t, 1, runner.writeCount)
 	assert.Equal(t, 1, res.CommitsRemapped)
 	assert.DirExists(t, filepath.Join(wd.GitExtractedDir(), "repositories", "Acme", "foo.git"))
@@ -112,7 +92,7 @@ func TestRun_IdempotentFinalArchiveSkipsExtractAndFilterRepo(t *testing.T) {
 	res, err := r.Run(context.Background())
 	require.NoError(t, err)
 	require.NotNil(t, res)
-	assert.Equal(t, 1, len(runner.runCalls))
+	assert.Equal(t, 1, len(runner.combinedCalls))
 	assert.Equal(t, 1, runner.writeCount)
 	assert.NoDirExists(t, wd.GitExtractedDir())
 }
@@ -125,7 +105,7 @@ func TestRun_MultipleBareReposRejected(t *testing.T) {
 	_, err := r.Run(context.Background())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "multi-repo migrations are not supported")
-	assert.Empty(t, runner.runCalls)
+	assert.Empty(t, runner.combinedCalls)
 }
 
 func TestRun_NoBareRepoRejected(t *testing.T) {
@@ -156,8 +136,9 @@ func TestRun_StripHappyPath(t *testing.T) {
 	assert.Equal(t, []string{"big1.bin", "big2.bin"}, res.PathsStripped)
 	assert.EqualValues(t, 5_000_000, res.LargestStripped)
 	assert.EqualValues(t, 7_000_000, res.BytesFreed)
-	require.Len(t, runner.stripCalls, 1)
-	assert.Equal(t, wd.CleanupTxt(), runner.stripCalls[0][1])
+	require.Len(t, runner.combinedCalls, 1)
+	assert.Equal(t, wd.CleanupTxt(), runner.combinedCalls[0].PathsFromFile)
+	assert.True(t, runner.combinedCalls[0].StripActive)
 
 	body, err := os.ReadFile(wd.CleanupTxt())
 	require.NoError(t, err)
@@ -177,7 +158,7 @@ func TestRun_StripZeroFlagged_NoStripStillArchives(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, res)
 	assert.False(t, res.StripPerformed)
-	assert.Empty(t, runner.stripCalls)
+	assert.Empty(t, runner.combinedCalls)
 	assert.FileExists(t, wd.GitArchive())
 }
 
@@ -193,7 +174,7 @@ func TestRun_NonTTYWithoutYes_Errors(t *testing.T) {
 	_, err := r.Run(context.Background())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "TTY")
-	assert.Empty(t, runner.stripCalls)
+	assert.Empty(t, runner.combinedCalls)
 }
 
 func TestRun_NonInteractiveWithoutYes_Errors(t *testing.T) {
@@ -208,7 +189,7 @@ func TestRun_NonInteractiveWithoutYes_Errors(t *testing.T) {
 	_, err := r.Run(context.Background())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "non-interactive")
-	assert.Empty(t, runner.stripCalls)
+	assert.Empty(t, runner.combinedCalls)
 }
 
 func TestRun_UserScriptsOnly(t *testing.T) {
@@ -222,9 +203,10 @@ func TestRun_UserScriptsOnly(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, res)
 	assert.Equal(t, []string{"rewrite.commit-callback.py"}, res.ScriptsRun)
-	require.Len(t, runner.callbackCalls, 1)
-	assert.Empty(t, runner.stripCalls)
-	assert.Empty(t, runner.runCalls)
+	require.Len(t, runner.combinedCalls, 1)
+	assert.Equal(t, []string{scriptPath}, runner.combinedCalls[0].ScriptPaths)
+	assert.Empty(t, runner.combinedCalls[0].PathsFromFile)
+	assert.Empty(t, runner.combinedCalls[0].PassthroughFlags)
 }
 
 func TestRun_UserFlagsOnly(t *testing.T) {
@@ -236,12 +218,13 @@ func TestRun_UserFlagsOnly(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, res)
 	assert.Equal(t, []string{"--refs", "main"}, res.UserFlagsApplied)
-	require.Len(t, runner.runCalls, 1)
-	assert.Empty(t, runner.stripCalls)
-	assert.Empty(t, runner.callbackCalls)
+	require.Len(t, runner.combinedCalls, 1)
+	assert.Equal(t, []string{"--refs", "main"}, runner.combinedCalls[0].PassthroughFlags)
+	assert.Empty(t, runner.combinedCalls[0].PathsFromFile)
+	assert.Empty(t, runner.combinedCalls[0].ScriptPaths)
 }
 
-func TestRun_StripScriptsAndFlags_OrderedAndAllCalled(t *testing.T) {
+func TestRun_StripScriptsAndFlags_SingleInvocation(t *testing.T) {
 	wd := newArchiveWorkDir(t, "foo.git")
 	scriptPath := filepath.Join(t.TempDir(), "x.commit-callback.py")
 	require.NoError(t, os.WriteFile(scriptPath, []byte("# noop"), 0o644))
@@ -260,10 +243,22 @@ func TestRun_StripScriptsAndFlags_OrderedAndAllCalled(t *testing.T) {
 	res, err := r.Run(context.Background())
 	require.NoError(t, err)
 	require.NotNil(t, res)
-	assert.Equal(t, []string{"strip", "callbacks", "run"}, runner.order)
+
+	// Strip + callbacks + flags must collapse into exactly ONE filter-repo
+	// invocation, producing exactly one commit-map.
+	require.Len(t, runner.combinedCalls, 1)
+	assert.Equal(t, 1, runner.writeCount)
+	opts := runner.combinedCalls[0]
+	assert.True(t, opts.StripActive)
+	assert.Equal(t, wd.CleanupTxt(), opts.PathsFromFile)
+	assert.Equal(t, []string{scriptPath}, opts.ScriptPaths)
+	assert.Equal(t, []string{"--refs", "main"}, opts.PassthroughFlags)
+
 	assert.True(t, res.StripPerformed)
 	assert.NotEmpty(t, res.ScriptsRun)
 	assert.NotEmpty(t, res.UserFlagsApplied)
+	assert.FileExists(t, wd.CommitMap())
+	assert.Equal(t, 1, res.CommitsRemapped)
 }
 
 func TestRun_StripWithPathSelectionFlag_Rejected(t *testing.T) {
@@ -278,7 +273,7 @@ func TestRun_StripWithPathSelectionFlag_Rejected(t *testing.T) {
 	_, err := r.Run(context.Background())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "--invert-paths")
-	assert.Empty(t, runner.stripCalls)
+	assert.Empty(t, runner.combinedCalls)
 }
 
 func TestRun_DuplicateCallbackKind_Rejected(t *testing.T) {
@@ -294,6 +289,33 @@ func TestRun_DuplicateCallbackKind_Rejected(t *testing.T) {
 	_, err := r.Run(context.Background())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "duplicate")
+}
+
+func TestRun_DuplicateCallbackKindAcrossScriptAndFlag_Rejected(t *testing.T) {
+	wd := newArchiveWorkDir(t, "foo.git")
+	script := filepath.Join(t.TempDir(), "a.commit-callback.py")
+	require.NoError(t, os.WriteFile(script, []byte("x"), 0o644))
+	runner := &stubRunner{}
+	r := makeRewriter(wd, runner, &stubAnalyzer{}, Config{
+		FilterRepoScripts: []string{script},
+		FilterRepoFlags:   []string{"--commit-callback=return commit"},
+	}, false, false)
+
+	_, err := r.Run(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "duplicate")
+	assert.Empty(t, runner.combinedCalls)
+}
+
+func TestRun_MissingCallbackScript_Rejected(t *testing.T) {
+	wd := newArchiveWorkDir(t, "foo.git")
+	missing := filepath.Join(t.TempDir(), "gone.commit-callback.py")
+	runner := &stubRunner{}
+	r := makeRewriter(wd, runner, &stubAnalyzer{}, Config{FilterRepoScripts: []string{missing}}, false, false)
+
+	_, err := r.Run(context.Background())
+	require.Error(t, err)
+	assert.Empty(t, runner.combinedCalls)
 }
 
 func TestRun_UnknownCallbackKind_Rejected(t *testing.T) {

@@ -80,11 +80,10 @@ type Result struct {
 
 // runnerIface is the minimal subset of *filterrepo.Runner the rewriter
 // uses. Defining it locally lets tests inject a stub without touching
-// filterrepo internals.
+// filterrepo internals. All mutating filter-repo work flows through a
+// single RunCombined call so exactly one commit-map is produced.
 type runnerIface interface {
-	StripPaths(ctx context.Context, bareRepoPath, pathsFromFile string) error
-	RunCallbackScripts(ctx context.Context, bareRepoPath string, scriptPaths []string) error
-	Run(ctx context.Context, bareRepoPath string, args []string) error
+	RunCombined(ctx context.Context, bareRepoPath string, opts filterrepo.CombinedOpts) error
 }
 
 // analyzerIface is the minimal subset of *largefiles.Analyzer the
@@ -202,30 +201,38 @@ func (r *Rewriter) Run(ctx context.Context, inputs ...Input) (*Result, error) {
 
 	result := &Result{}
 
+	var pathsFromFile string
 	if r.cfg.StripLargeFiles {
-		if err := r.runStrip(ctx, bareRepoPath, result); err != nil {
+		stripReady, err := r.prepareStrip(ctx, bareRepoPath, result)
+		if err != nil {
 			return nil, err
+		}
+		if stripReady {
+			pathsFromFile = r.wd.CleanupTxt()
 		}
 	}
 
-	if len(r.cfg.FilterRepoScripts) > 0 {
-		if err := r.runner.RunCallbackScripts(ctx, bareRepoPath, r.cfg.FilterRepoScripts); err != nil {
-			return nil, fmt.Errorf("filter-repo callbacks: %w", err)
+	rewriteRan := pathsFromFile != "" || len(r.cfg.FilterRepoScripts) > 0 || len(r.cfg.FilterRepoFlags) > 0
+	if rewriteRan {
+		opts := filterrepo.CombinedOpts{
+			StripActive:      r.cfg.StripLargeFiles,
+			PathsFromFile:    pathsFromFile,
+			ScriptPaths:      r.cfg.FilterRepoScripts,
+			PassthroughFlags: r.cfg.FilterRepoFlags,
+		}
+		if err := r.runner.RunCombined(ctx, bareRepoPath, opts); err != nil {
+			return nil, fmt.Errorf("filter-repo rewrite: %w", err)
+		}
+		if pathsFromFile != "" {
+			result.StripPerformed = true
 		}
 		for _, p := range r.cfg.FilterRepoScripts {
 			result.ScriptsRun = append(result.ScriptsRun, filepath.Base(p))
 		}
-	}
-
-	if len(r.cfg.FilterRepoFlags) > 0 {
-		if err := r.runner.Run(ctx, bareRepoPath, r.cfg.FilterRepoFlags); err != nil {
-			return nil, fmt.Errorf("filter-repo passthrough: %w", err)
+		if len(r.cfg.FilterRepoFlags) > 0 {
+			result.UserFlagsApplied = sanitizeUserFlags(r.cfg.FilterRepoFlags)
 		}
-		result.UserFlagsApplied = sanitizeUserFlags(r.cfg.FilterRepoFlags)
-	}
 
-	rewriteRan := result.StripPerformed || len(result.ScriptsRun) > 0 || len(result.UserFlagsApplied) > 0
-	if rewriteRan {
 		w := "git filter-repo strips GPG signatures; rewritten commits will be unsigned."
 		result.Warnings = append(result.Warnings, w)
 		r.warn(w)
@@ -319,27 +326,34 @@ func wrapFindBareRepoError(root string, err error) error {
 	}
 }
 
-func (r *Rewriter) runStrip(ctx context.Context, bareRepoPath string, result *Result) error {
+// prepareStrip runs the read-only large-file analysis, writes cleanup.txt,
+// prints the flagged table, and performs the Gate-1 confirmation. It does
+// NOT execute filter-repo — the actual strip is folded into the single
+// RunCombined invocation. It populates the strip-related Result fields
+// (paths, bytes) but leaves StripPerformed for the caller to set only after
+// the unified rewrite succeeds. Returns true when there are flagged paths to
+// strip (i.e. cleanup.txt is ready to feed RunCombined).
+func (r *Rewriter) prepareStrip(ctx context.Context, bareRepoPath string, result *Result) (bool, error) {
 	report, err := r.analyzer.Analyze(ctx, bareRepoPath)
 	if err != nil {
-		return fmt.Errorf("analyze large files: %w", err)
+		return false, fmt.Errorf("analyze large files: %w", err)
 	}
 	if len(report.Flagged) == 0 {
 		r.info("no files exceed threshold; nothing to strip")
-		return nil
+		return false, nil
 	}
 	if err := report.WriteCleanupFile(r.wd.CleanupTxt()); err != nil {
-		return fmt.Errorf("write cleanup.txt: %w", err)
+		return false, fmt.Errorf("write cleanup.txt: %w", err)
 	}
 	r.printFlaggedTable(report)
 
 	// Gate 1.
 	if !r.cfg.SkipConfirm {
 		if r.cfg.NonInteractive {
-			return errors.New("--yes required to strip files when --non-interactive is set")
+			return false, errors.New("--yes required to strip files when --non-interactive is set")
 		}
 		if !r.isTTY() {
-			return errors.New("--yes required to strip files when not running on a TTY")
+			return false, errors.New("--yes required to strip files when not running on a TTY")
 		}
 		prompt := fmt.Sprintf(
 			"Strip these %d paths from history? This rewrites all commits.",
@@ -347,17 +361,13 @@ func (r *Rewriter) runStrip(ctx context.Context, bareRepoPath string, result *Re
 		)
 		ok, err := r.confirm(prompt, false)
 		if err != nil {
-			return fmt.Errorf("confirmation prompt failed: %w", err)
+			return false, fmt.Errorf("confirmation prompt failed: %w", err)
 		}
 		if !ok {
-			return errors.New("rewrite aborted by user")
+			return false, errors.New("rewrite aborted by user")
 		}
 	}
 
-	if err := r.runner.StripPaths(ctx, bareRepoPath, r.wd.CleanupTxt()); err != nil {
-		return fmt.Errorf("filter-repo strip: %w", err)
-	}
-	result.StripPerformed = true
 	for _, f := range report.Flagged {
 		result.PathsStripped = append(result.PathsStripped, f.Path)
 		fp := f.Footprint()
@@ -366,18 +376,33 @@ func (r *Rewriter) runStrip(ctx context.Context, bareRepoPath string, result *Re
 			result.LargestStripped = fp
 		}
 	}
-	return nil
+	return true, nil
 }
 
 func (r *Rewriter) validateScripts() error {
+	// Seed seen-kinds from passthrough callback flags so a kind supplied
+	// both via a --filter-repo-script and a --filter-repo-flag is caught
+	// early (before analyze/Gate-1), matching RunCombined's guard.
 	seen := map[string]string{}
+	for _, raw := range r.cfg.FilterRepoFlags {
+		name := raw
+		if i := strings.IndexByte(raw, '='); i >= 0 {
+			name = raw[:i]
+		}
+		if strings.HasPrefix(name, "-") && strings.HasSuffix(name, "-callback") {
+			seen[name] = "--filter-repo-flag " + name
+		}
+	}
 	for _, p := range r.cfg.FilterRepoScripts {
 		kind, err := filterrepo.CallbackKindFor(p)
 		if err != nil {
 			return err
 		}
 		if other, dup := seen[kind]; dup {
-			return fmt.Errorf("duplicate %s scripts: %s and %s", kind, other, p)
+			return fmt.Errorf("duplicate %s callback: %s and %s", kind, other, p)
+		}
+		if _, err := os.Stat(p); err != nil {
+			return fmt.Errorf("callback script %s: %w", p, err)
 		}
 		seen[kind] = p
 	}

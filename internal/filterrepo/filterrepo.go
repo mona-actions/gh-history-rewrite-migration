@@ -401,17 +401,92 @@ func redactForLog(args []string) string {
 	return strings.Join(out, " ")
 }
 
-// Run executes `git filter-repo <args>` from inside bareRepoPath after
-// validating args via ValidateUserFlags(args, false). It is intended for
-// standalone rewrite operations not coupled to the strip workflow.
-func (r *Runner) Run(ctx context.Context, bareRepoPath string, args []string) error {
-	if err := ValidateUserFlags(args, false); err != nil {
+// CombinedOpts configures a single, unified mutating filter-repo
+// invocation that folds the large-file strip, user callback scripts, and
+// passthrough flags into one pass. Running them together guarantees
+// exactly one commit-map is produced mapping original SHAs to final SHAs;
+// separate sequential passes would each emit (and overwrite) a commit-map,
+// leaving only an intermediate→final mapping on disk.
+type CombinedOpts struct {
+	// StripActive reflects the operator's --strip-large-files intent. It
+	// drives the strip-blocked path-selection validation independently of
+	// whether any paths were ultimately flagged, so the guard agrees with
+	// the orchestrator's early fail-fast check even when nothing exceeds
+	// the threshold. It is an explicit input, never re-derived from
+	// PathsFromFile.
+	StripActive bool
+	// PathsFromFile, when non-empty, adds --invert-paths --paths-from-file
+	// <PathsFromFile> to the invocation. It is only set when a strip was
+	// requested AND at least one path was flagged.
+	PathsFromFile string
+	// ScriptPaths are user callback scripts dispatched by filename suffix
+	// (see CallbackKindFor). Bodies are read and attached as flag/body
+	// pairs; contents are never logged.
+	ScriptPaths []string
+	// PassthroughFlags are raw filter-repo argv tokens supplied via
+	// --filter-repo-flag. They are validated via ValidateUserFlags.
+	PassthroughFlags []string
+
+	// Future extension seam: an optional pre-built input stream (e.g. a
+	// `git fast-export | <script> | …` pipeline) could be added here as an
+	// io.Reader alongside a --stdin mode. Doing so will also require
+	// extending the Execer interface to accept an stdin reader; CombinedOpts
+	// itself can grow that field without reworking existing callers.
+}
+
+// RunCombined executes a single `git filter-repo` invocation from inside
+// bareRepoPath that combines the optional large-file strip, any callback
+// scripts, and passthrough flags. Exactly one filter-repo process runs, so
+// exactly one commit-map (original→final) is produced.
+//
+// Validation mirrors the standalone helpers it replaces: passthrough flags
+// are checked via ValidateUserFlags(opts.PassthroughFlags, opts.StripActive);
+// callback kinds are dispatched by filename suffix with unknown suffixes and
+// duplicate kinds rejected — including a kind supplied BOTH via a passthrough
+// --*-callback flag AND a script. Script bodies are never logged.
+func (r *Runner) RunCombined(ctx context.Context, bareRepoPath string, opts CombinedOpts) error {
+	if err := ValidateUserFlags(opts.PassthroughFlags, opts.StripActive); err != nil {
 		return err
 	}
-	full := append([]string{"filter-repo", "--force"}, args...)
-	r.info(fmt.Sprintf("running git %s", redactForLog(full)))
+
+	args := []string{"filter-repo", "--force"}
+	if opts.PathsFromFile != "" {
+		args = append(args, "--invert-paths", "--paths-from-file", opts.PathsFromFile)
+		r.info(fmt.Sprintf("stripping paths listed in %s", opts.PathsFromFile))
+	}
+
+	// Seed seen-kinds from passthrough callback flags so a kind supplied
+	// both via --filter-repo-flag and a script is rejected.
+	seen := map[string]string{}
+	for _, raw := range opts.PassthroughFlags {
+		name := flagName(raw)
+		if strings.HasSuffix(name, "-callback") {
+			seen[name] = "--filter-repo-flag " + name
+		}
+	}
+
+	for _, p := range opts.ScriptPaths {
+		flag, err := CallbackKindFor(p)
+		if err != nil {
+			return err
+		}
+		if other, dup := seen[flag]; dup {
+			return fmt.Errorf("duplicate %s callback: %s and %s — filter-repo accepts only one body per callback kind", flag, other, p)
+		}
+		body, err := os.ReadFile(p)
+		if err != nil {
+			return fmt.Errorf("read callback script %s: %w", p, err)
+		}
+		seen[flag] = p
+		args = append(args, flag, string(body))
+		r.info(fmt.Sprintf("attaching %s callback from %s", flag, p))
+	}
+
+	args = append(args, opts.PassthroughFlags...)
+
+	r.info(fmt.Sprintf("running git %s", redactForLog(args)))
 	var stderr bytes.Buffer
-	if err := r.execer.Run(ctx, bareRepoPath, r.bin, full, r.stdout, &stderr); err != nil {
+	if err := r.execer.Run(ctx, bareRepoPath, r.bin, args, r.stdout, &stderr); err != nil {
 		return fmt.Errorf("git filter-repo failed: %w (stderr=%q)", err, stderr.String())
 	}
 	return nil
@@ -437,58 +512,6 @@ func knownSuffixes() string {
 	}
 	sort.Strings(suffixes)
 	return strings.Join(suffixes, ", ")
-}
-
-// RunCallbackScripts dispatches each script to its filter-repo callback
-// flag (inferred from filename suffix), reads the body, and runs them all
-// in a single filter-repo invocation. Duplicate callback kinds are
-// rejected.
-//
-// Script paths are logged but script *contents* are never logged.
-func (r *Runner) RunCallbackScripts(ctx context.Context, bareRepoPath string, scriptPaths []string) error {
-	if len(scriptPaths) == 0 {
-		return nil
-	}
-	seen := map[string]string{} // flag -> path that introduced it
-	args := []string{"filter-repo", "--force"}
-	for _, p := range scriptPaths {
-		flag, err := CallbackKindFor(p)
-		if err != nil {
-			return err
-		}
-		if other, dup := seen[flag]; dup {
-			return fmt.Errorf("duplicate %s scripts: %s and %s — filter-repo accepts only one body per callback kind", flag, other, p)
-		}
-		body, err := os.ReadFile(p)
-		if err != nil {
-			return fmt.Errorf("read callback script %s: %w", p, err)
-		}
-		seen[flag] = p
-		args = append(args, flag, string(body))
-		r.info(fmt.Sprintf("attaching %s callback from %s", flag, p))
-	}
-	var stderr bytes.Buffer
-	if err := r.execer.Run(ctx, bareRepoPath, r.bin, args, r.stdout, &stderr); err != nil {
-		return fmt.Errorf("git filter-repo (callbacks) failed: %w (stderr=%q)", err, stderr.String())
-	}
-	return nil
-}
-
-// StripPaths invokes filter-repo with --invert-paths --paths-from-file
-// <pathsFromFile> --force. This flag combo is owned by the orchestrator;
-// users may not pass --invert-paths / --paths-from-file directly while
-// --strip-large-files is active (see ValidateUserFlags).
-func (r *Runner) StripPaths(ctx context.Context, bareRepoPath, pathsFromFile string) error {
-	if pathsFromFile == "" {
-		return errors.New("pathsFromFile is required")
-	}
-	args := []string{"filter-repo", "--invert-paths", "--paths-from-file", pathsFromFile, "--force"}
-	r.info(fmt.Sprintf("stripping paths listed in %s", pathsFromFile))
-	var stderr bytes.Buffer
-	if err := r.execer.Run(ctx, bareRepoPath, r.bin, args, r.stdout, &stderr); err != nil {
-		return fmt.Errorf("git filter-repo --invert-paths failed: %w (stderr=%q)", err, stderr.String())
-	}
-	return nil
 }
 
 // CountCommitsRemapped returns the number of old->new SHA mappings in a

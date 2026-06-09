@@ -4,7 +4,7 @@
 // It builds on internal/filterrepo: the Analyzer struct calls
 // filterrepo.Runner.Analyze, applies a max+cumulative threshold rule, and
 // produces both an in-memory Report and the cleanup.txt file consumed by
-// filterrepo.Runner.StripPaths.
+// filterrepo.Runner.RunCombined (via CombinedOpts.PathsFromFile).
 //
 // This package is library-only — it registers no cobra commands. The
 // rewrite/migrate orchestrators wire it up.
@@ -126,7 +126,8 @@ func (a *Analyzer) report(res *filterrepo.AnalyzeResult) *Report {
 
 // WriteCleanupFile writes one flagged path per line to dest in the order
 // they appear in r.Flagged. The resulting file is suitable as the
-// --paths-from-file argument for filterrepo.Runner.StripPaths.
+// --paths-from-file argument for filterrepo.Runner.RunCombined
+// (CombinedOpts.PathsFromFile).
 //
 // An empty Flagged slice still writes an empty file — callers should
 // short-circuit before calling if that is undesirable.
