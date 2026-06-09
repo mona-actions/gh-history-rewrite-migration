@@ -450,8 +450,20 @@ type CombinedOpts struct {
 	// validated via ValidateUserFlags.
 	PassthroughFlags []string
 
-	// Extension seam: a future --stdin mode (e.g. fast-export | script | …)
-	// can add an io.Reader here without reworking existing callers.
+	// PreRewriteScripts are user-supplied executables that filter the raw
+	// `git fast-export` byte stream BEFORE filter-repo parses it. When
+	// non-empty, Run switches from operating on the bare repo
+	// directly to the stdin form:
+	//
+	//   git fast-export --all … | <script…> | git filter-repo --stdin <args>
+	//
+	// This is the only place a malformed object that crashes filter-repo's
+	// parser (e.g. a bad author ident) can be repaired. The same strip /
+	// callback / passthrough args are appended to the filter-repo stage, so
+	// a single commit-map (original→final) is still produced. Scripts are
+	// validated (regular + executable + shebang) and run with a sanitized
+	// environment; see runPreRewritePipeline.
+	PreRewriteScripts []string
 }
 
 // Run executes one `git filter-repo` combining strip, callback scripts, and
@@ -460,6 +472,11 @@ type CombinedOpts struct {
 func (r *Runner) Run(ctx context.Context, bareRepoPath string, opts CombinedOpts) error {
 	if err := ValidateUserFlags(opts.PassthroughFlags, opts.StripActive); err != nil {
 		return err
+	}
+	if len(opts.PreRewriteScripts) > 0 {
+		if err := ValidatePreRewriteFlags(opts.PassthroughFlags); err != nil {
+			return err
+		}
 	}
 
 	args := []string{"filter-repo", "--force"}
@@ -493,6 +510,10 @@ func (r *Runner) Run(ctx context.Context, bareRepoPath string, opts CombinedOpts
 	}
 
 	args = append(args, opts.PassthroughFlags...)
+
+	if len(opts.PreRewriteScripts) > 0 {
+		return r.runPreRewritePipeline(ctx, bareRepoPath, args, opts.PreRewriteScripts)
+	}
 
 	r.info(fmt.Sprintf("running git %s", redactForLog(args)))
 	var stderr bytes.Buffer

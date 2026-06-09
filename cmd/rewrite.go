@@ -39,6 +39,7 @@ func init() {
 	rewriteCmd.Flags().Bool("strip-large-files", false, "Analyze the repo and strip files exceeding --large-file-threshold")
 	rewriteCmd.Flags().StringSlice("filter-repo-script", nil, "Path to a user filter-repo callback script (repeatable)")
 	rewriteCmd.Flags().StringSlice("filter-repo-flag", nil, "Raw filter-repo flag/arg to pass through (repeatable)")
+	rewriteCmd.Flags().StringSlice("pre-rewrite-script", nil, "Path to an executable that filters the raw git fast-export stream before filter-repo parses it (repeatable; for history that crashes the parser, e.g. malformed author idents)")
 	rewriteCmd.Flags().Bool("yes", false, "Skip the strip-confirmation prompt (Gate 1)")
 	rewriteCmd.Flags().Bool("non-interactive", false, "Error rather than prompt when a gate would block")
 
@@ -77,6 +78,7 @@ func runRewrite(cmd *cobra.Command, _ []string) error {
 	stripFlag, _ := cmd.Flags().GetBool("strip-large-files")
 	scripts, _ := cmd.Flags().GetStringSlice("filter-repo-script")
 	flags, _ := cmd.Flags().GetStringSlice("filter-repo-flag")
+	preScripts, _ := cmd.Flags().GetStringSlice("pre-rewrite-script")
 	yes, _ := cmd.Flags().GetBool("yes")
 	nonInteractive, _ := cmd.Flags().GetBool("non-interactive")
 
@@ -89,6 +91,7 @@ func runRewrite(cmd *cobra.Command, _ []string) error {
 		LargeFileThreshold: threshold,
 		FilterRepoScripts:  scripts,
 		FilterRepoFlags:    flags,
+		PreRewriteScripts:  preScripts,
 		SkipConfirm:        yes,
 		NonInteractive:     nonInteractive,
 	}
