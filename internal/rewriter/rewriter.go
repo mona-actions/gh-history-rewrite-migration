@@ -203,12 +203,9 @@ func (r *Rewriter) Run(ctx context.Context, inputs ...Input) (*Result, error) {
 
 	var pathsFromFile string
 	if r.cfg.StripLargeFiles {
-		stripReady, err := r.prepareStrip(ctx, bareRepoPath, result)
+		pathsFromFile, err = r.prepareStrip(ctx, bareRepoPath, result)
 		if err != nil {
 			return nil, err
-		}
-		if stripReady {
-			pathsFromFile = r.wd.CleanupTxt()
 		}
 	}
 
@@ -328,34 +325,31 @@ func wrapFindBareRepoError(root string, err error) error {
 	}
 }
 
-// prepareStrip runs the read-only large-file analysis, writes cleanup.txt,
-// prints the flagged table, and performs the Gate-1 confirmation. It does
-// NOT execute filter-repo — the actual strip is folded into the single
-// Run invocation. It populates the strip-related Result fields
-// (paths, bytes) but leaves StripPerformed for the caller to set only after
-// the unified rewrite succeeds. Returns true when there are flagged paths to
-// strip (i.e. cleanup.txt is ready to feed Run).
-func (r *Rewriter) prepareStrip(ctx context.Context, bareRepoPath string, result *Result) (bool, error) {
+// prepareStrip analyzes large files, writes cleanup.txt, prints the table, and
+// runs Gate-1 confirmation. It does NOT run filter-repo (the strip is folded
+// into Run); StripPerformed is set by the caller after the rewrite succeeds.
+// Returns the cleanup.txt path to feed Run, or "" when nothing is flagged.
+func (r *Rewriter) prepareStrip(ctx context.Context, bareRepoPath string, result *Result) (string, error) {
 	report, err := r.analyzer.Analyze(ctx, bareRepoPath)
 	if err != nil {
-		return false, fmt.Errorf("analyze large files: %w", err)
+		return "", fmt.Errorf("analyze large files: %w", err)
 	}
 	if len(report.Flagged) == 0 {
 		r.info("no files exceed threshold; nothing to strip")
-		return false, nil
+		return "", nil
 	}
 	if err := report.WriteCleanupFile(r.wd.CleanupTxt()); err != nil {
-		return false, fmt.Errorf("write cleanup.txt: %w", err)
+		return "", fmt.Errorf("write cleanup.txt: %w", err)
 	}
 	r.printFlaggedTable(report)
 
 	// Gate 1.
 	if !r.cfg.SkipConfirm {
 		if r.cfg.NonInteractive {
-			return false, errors.New("--yes required to strip files when --non-interactive is set")
+			return "", errors.New("--yes required to strip files when --non-interactive is set")
 		}
 		if !r.isTTY() {
-			return false, errors.New("--yes required to strip files when not running on a TTY")
+			return "", errors.New("--yes required to strip files when not running on a TTY")
 		}
 		prompt := fmt.Sprintf(
 			"Strip these %d paths from history? This rewrites all commits.",
@@ -363,10 +357,10 @@ func (r *Rewriter) prepareStrip(ctx context.Context, bareRepoPath string, result
 		)
 		ok, err := r.confirm(prompt, false)
 		if err != nil {
-			return false, fmt.Errorf("confirmation prompt failed: %w", err)
+			return "", fmt.Errorf("confirmation prompt failed: %w", err)
 		}
 		if !ok {
-			return false, errors.New("rewrite aborted by user")
+			return "", errors.New("rewrite aborted by user")
 		}
 	}
 
@@ -378,7 +372,7 @@ func (r *Rewriter) prepareStrip(ctx context.Context, bareRepoPath string, result
 			result.LargestStripped = fp
 		}
 	}
-	return true, nil
+	return r.wd.CleanupTxt(), nil
 }
 
 func (r *Rewriter) validateScripts() error {
@@ -386,14 +380,8 @@ func (r *Rewriter) validateScripts() error {
 	// both via a --filter-repo-script and a --filter-repo-flag is caught
 	// early (before analyze/Gate-1), matching Run's guard.
 	seen := map[string]string{}
-	for _, raw := range r.cfg.FilterRepoFlags {
-		name := raw
-		if i := strings.IndexByte(raw, '='); i >= 0 {
-			name = raw[:i]
-		}
-		if strings.HasPrefix(name, "-") && strings.HasSuffix(name, "-callback") {
-			seen[name] = "--filter-repo-flag " + name
-		}
+	for name := range filterrepo.PassthroughCallbackKinds(r.cfg.FilterRepoFlags) {
+		seen[name] = "--filter-repo-flag " + name
 	}
 	for _, p := range r.cfg.FilterRepoScripts {
 		kind, err := filterrepo.CallbackKindFor(p)

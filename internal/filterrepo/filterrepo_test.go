@@ -97,6 +97,29 @@ func TestValidateUserFlags_NonFlagTokensIgnored(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestValidateUserFlags_FlagLikeCallbackBodyNotMisread(t *testing.T) {
+	// A two-token callback whose body happens to look like a reserved or
+	// path-family flag must be treated as a body, not validated as a flag.
+	require.NoError(t, ValidateUserFlags([]string{"--commit-callback", "--force"}, false))
+	require.NoError(t, ValidateUserFlags([]string{"--commit-callback", "--invert-paths"}, true))
+	// A flag-like body must not seed a false duplicate against a later kind.
+	require.NoError(t, ValidateUserFlags([]string{"--commit-callback", "--blob-callback", "--email-callback", "x"}, false))
+}
+
+func TestPassthroughCallbackKinds(t *testing.T) {
+	// Inline and two-token callback flags are collected; bodies (even
+	// flag-like ones) are skipped; non-callback flags are ignored.
+	got := PassthroughCallbackKinds([]string{
+		"--commit-callback", "--blob-callback", // body is flag-like, must be skipped
+		"--email-callback=lower()", // inline form
+		"--refs", "main",
+	})
+	assert.Equal(t, map[string]bool{
+		"--commit-callback": true,
+		"--email-callback":  true,
+	}, got)
+}
+
 func TestCallbackKindFor_AllSuffixes(t *testing.T) {
 	cases := map[string]string{
 		"x.commit-callback.py":   "--commit-callback",

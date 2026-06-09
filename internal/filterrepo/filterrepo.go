@@ -340,7 +340,12 @@ func extractPathColumn(line string) string {
 //	["--commit-callback=path/to/cb.py", "--refs", "main"]
 func ValidateUserFlags(flags []string, stripActive bool) error {
 	callbackSeen := map[string]struct{}{}
+	skipNext := false
 	for _, raw := range flags {
+		if skipNext {
+			skipNext = false
+			continue
+		}
 		name := flagName(raw)
 		if name == "" {
 			continue
@@ -358,6 +363,11 @@ func ValidateUserFlags(flags []string, stripActive bool) error {
 				return fmt.Errorf("duplicate %s flag: filter-repo accepts only one body per callback kind", name)
 			}
 			callbackSeen[name] = struct{}{}
+			// Two-token form (--x-callback <body>): the body follows as its
+			// own token; skip it so a flag-like body isn't validated as a flag.
+			if !strings.Contains(raw, "=") {
+				skipNext = true
+			}
 		}
 	}
 	return nil
@@ -373,6 +383,29 @@ func flagName(tok string) string {
 		return tok[:eq]
 	}
 	return tok
+}
+
+// PassthroughCallbackKinds returns the set of callback kinds (e.g.
+// "--commit-callback") present as flags among raw passthrough tokens. It
+// skips the body of a two-token "--x-callback <body>" form so a flag-like
+// body is never misread as a callback flag.
+func PassthroughCallbackKinds(flags []string) map[string]bool {
+	kinds := map[string]bool{}
+	skipNext := false
+	for _, raw := range flags {
+		if skipNext {
+			skipNext = false
+			continue
+		}
+		name := flagName(raw)
+		if strings.HasSuffix(name, "-callback") {
+			kinds[name] = true
+			if !strings.Contains(raw, "=") {
+				skipNext = true
+			}
+		}
+	}
+	return kinds
 }
 
 // redactForLog joins args for logging but redacts callback bodies.
@@ -438,11 +471,8 @@ func (r *Runner) Run(ctx context.Context, bareRepoPath string, opts CombinedOpts
 	// Seed seen-kinds from passthrough callback flags so a kind supplied
 	// both via --filter-repo-flag and a script is rejected.
 	seen := map[string]string{}
-	for _, raw := range opts.PassthroughFlags {
-		name := flagName(raw)
-		if strings.HasSuffix(name, "-callback") {
-			seen[name] = "--filter-repo-flag " + name
-		}
+	for name := range PassthroughCallbackKinds(opts.PassthroughFlags) {
+		seen[name] = "--filter-repo-flag " + name
 	}
 
 	for _, p := range opts.ScriptPaths {
