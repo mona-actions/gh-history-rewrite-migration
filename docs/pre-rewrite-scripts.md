@@ -12,10 +12,11 @@ crashes `git fast-import` (which `filter-repo` drives) with
 `fatal: Missing > in ident string` (or `Invalid raw date`, or a `badEmail`
 on `git fsck`) **before any callback runs**.
 
-The eight [`--filter-repo-script`](callback-scripts.md) callbacks cannot fix
-this. They execute *inside* filter-repo's parse loop, after the ident line has
-already been parsed into an object — so a stream that won't parse never reaches
-them.
+`git filter-repo`'s callback hooks — the eight
+[`--filter-repo-script`](callback-scripts.md) kinds (`commit`, `email`, `blob`,
+`filename`, `message`, `refname`, `tag`, and `reset`) — cannot fix this. They
+execute *inside* filter-repo's parse loop, after the ident line has already been
+parsed into an object, so a stream that won't parse never reaches them.
 
 `--pre-rewrite-script` fills that gap: it is a user-supplied filter for the
 **pre-parse stage**, applied to the raw `git fast-export` byte stream *before*
@@ -55,6 +56,56 @@ It is also available on the advanced `rewrite` subcommand.
 
 ---
 
+## Hello World: the smallest possible script
+
+Before the production example, here is the whole idea in one tiny script. A
+pre-rewrite script is just a filter — \*\*bytes in on stdin, bytes out on
+stdout\*\* — and the simplest useful one rewrites a single author identity across
+all of history:
+
+```perl
+#!/usr/bin/env perl
+use strict; use warnings;
+binmode STDIN; binmode STDOUT;
+
+my $OLD = 'Old Name <old@example.com>';
+my $NEW = 'New Name <new@example.com>';
+
+while (defined(my $line = <STDIN>)) {
+    # Copy `data <N>` payloads (blobs, messages) through untouched.
+    if ($line =~ /^data (\d+)\n\z/) {
+        print $line;
+        my $remaining = $1;
+        while ($remaining > 0) {
+            my $got = read(STDIN, my $chunk, $remaining) or last;
+            print $chunk;
+            $remaining -= $got;
+        }
+        next;
+    }
+    # Only touch identity lines.
+    $line =~ s/\Q$OLD\E/$NEW/ if $line =~ /^(?:author|committer|tagger) /;
+    print $line;
+}
+```
+
+That is the runnable
+[`examples/scripts/hello-world.pre-rewrite.pl`](../examples/scripts/hello-world.pre-rewrite.pl).
+Edit the two variables, then:
+
+```bash
+gh history-rewrite-migration migrate \
+    --org acme --repo legacy --target-org acme-cloud \
+    --pre-rewrite-script ./examples/scripts/hello-world.pre-rewrite.pl
+```
+
+Even this minimal script already follows the two non-negotiable rules
+(byte-oriented I/O, and copying `data <N>` payloads verbatim). The next section
+explains those rules in full; the production example after it builds on exactly
+this shape.
+
+---
+
 ## The stream contract
 
 A pre-rewrite script is a filter: **bytes from stdin → bytes to stdout**. It
@@ -69,16 +120,16 @@ must emit a valid `git fast-import` stream. Three rules keep it correct:
 2. **Respect `data <N>` framing.** Blob contents, commit messages and tag
    messages are emitted as length-prefixed blocks:
 
-   ```text
-   data 77
+```text
+  data 77
    <exactly 77 raw bytes, which may contain anything>
-   ```
+```
 
    You must copy those `N` bytes through verbatim. If you treat the stream as
-   plain lines, a line *inside a file* that happens to start with `author ` (or
+   plain lines, a line *inside a file* that happens to start with `author`  (or
    any token you rewrite) will be mangled — the classic symptom is filter-repo
    later dying with `Could not parse line: 'b'ob''` because a blob got
-   corrupted. Read the `N` after `data `, copy that many bytes, then resume
+   corrupted. Read the `N` after `data` , copy that many bytes, then resume
    line processing.
 
 3. **Only touch what you mean to.** Anchor edits to the specific command lines
@@ -91,8 +142,8 @@ must emit a valid `git fast-import` stream. Three rules keep it correct:
 
 `git fast-export --show-original-ids` emits an `original-oid <sha>` line before
 each object. Those lines are what let filter-repo build the original → final
-`commit-map` that the metadata remap consumes. **Do not drop, reorder, or
-rewrite `original-oid` lines, and do not synthesize new commits.** A script that
+`commit-map` that the metadata remap consumes. \*\*Do not drop, reorder, or
+rewrite `original-oid` lines, and do not synthesize new commits.\*\* A script that
 mangles them will silently break the remap: metadata that references the
 original SHA will fail to map to the rewritten one.
 
@@ -124,8 +175,8 @@ The orchestrator wires them defensively:
 - **Executed via their shebang.** Each script is run as an argv array
   (`exec` of the absolute path), so the kernel honors its `#!/usr/bin/env perl`
   (or `python3`, etc.) line. The orchestrator never guesses an interpreter or
-  builds an interpreter command string. Scripts must therefore be **regular,
-  executable files with a shebang**; this is validated up front, before any
+  builds an interpreter command string. Scripts must therefore be \*\*regular,
+  executable files with a shebang\*\*; this is validated up front, before any
   process starts.
 - **Sanitized environment.** Your script receives a minimal allow-listed
   environment (`PATH`, `HOME`, `LC_ALL`, `LANG`) — the migration PATs
