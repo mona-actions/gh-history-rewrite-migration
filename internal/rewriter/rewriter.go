@@ -381,10 +381,8 @@ func (r *Rewriter) prepareStrip(ctx context.Context, bareRepoPath string, result
 	return r.wd.CleanupTxt(), nil
 }
 
+// checks flags for scripts and duplicate flags before any rewrite work
 func (r *Rewriter) validateScripts() error {
-	// Seed seen-kinds from passthrough callback flags so a kind supplied
-	// both via a --filter-repo-script and a --filter-repo-flag is caught
-	// early (before analyze/Gate-1), matching Run's guard.
 	seen := map[string]string{}
 	for name := range filterrepo.PassthroughCallbackKinds(r.cfg.FilterRepoFlags) {
 		seen[name] = "--filter-repo-flag " + name
