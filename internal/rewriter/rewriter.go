@@ -80,11 +80,10 @@ type Result struct {
 
 // runnerIface is the minimal subset of *filterrepo.Runner the rewriter
 // uses. Defining it locally lets tests inject a stub without touching
-// filterrepo internals.
+// filterrepo internals. All mutating filter-repo work goes through a
+// single Run call so exactly one commit-map is produced.
 type runnerIface interface {
-	StripPaths(ctx context.Context, bareRepoPath, pathsFromFile string) error
-	RunCallbackScripts(ctx context.Context, bareRepoPath string, scriptPaths []string) error
-	Run(ctx context.Context, bareRepoPath string, args []string) error
+	Run(ctx context.Context, bareRepoPath string, opts filterrepo.CombinedOpts) error
 }
 
 // analyzerIface is the minimal subset of *largefiles.Analyzer the
@@ -202,30 +201,35 @@ func (r *Rewriter) Run(ctx context.Context, inputs ...Input) (*Result, error) {
 
 	result := &Result{}
 
+	var pathsFromFile string
 	if r.cfg.StripLargeFiles {
-		if err := r.runStrip(ctx, bareRepoPath, result); err != nil {
+		pathsFromFile, err = r.prepareStrip(ctx, bareRepoPath, result)
+		if err != nil {
 			return nil, err
 		}
 	}
 
-	if len(r.cfg.FilterRepoScripts) > 0 {
-		if err := r.runner.RunCallbackScripts(ctx, bareRepoPath, r.cfg.FilterRepoScripts); err != nil {
-			return nil, fmt.Errorf("filter-repo callbacks: %w", err)
+	rewriteRan := pathsFromFile != "" || len(r.cfg.FilterRepoScripts) > 0 || len(r.cfg.FilterRepoFlags) > 0
+	if rewriteRan {
+		opts := filterrepo.CombinedOpts{
+			StripActive:      r.cfg.StripLargeFiles,
+			PathsFromFile:    pathsFromFile,
+			ScriptPaths:      r.cfg.FilterRepoScripts,
+			PassthroughFlags: r.cfg.FilterRepoFlags,
+		}
+		if err := r.runner.Run(ctx, bareRepoPath, opts); err != nil {
+			return nil, fmt.Errorf("filter-repo rewrite: %w", err)
+		}
+		if pathsFromFile != "" {
+			result.StripPerformed = true
 		}
 		for _, p := range r.cfg.FilterRepoScripts {
 			result.ScriptsRun = append(result.ScriptsRun, filepath.Base(p))
 		}
-	}
-
-	if len(r.cfg.FilterRepoFlags) > 0 {
-		if err := r.runner.Run(ctx, bareRepoPath, r.cfg.FilterRepoFlags); err != nil {
-			return nil, fmt.Errorf("filter-repo passthrough: %w", err)
+		if len(r.cfg.FilterRepoFlags) > 0 {
+			result.UserFlagsApplied = sanitizeUserFlags(r.cfg.FilterRepoFlags)
 		}
-		result.UserFlagsApplied = sanitizeUserFlags(r.cfg.FilterRepoFlags)
-	}
 
-	rewriteRan := result.StripPerformed || len(result.ScriptsRun) > 0 || len(result.UserFlagsApplied) > 0
-	if rewriteRan {
 		w := "git filter-repo strips GPG signatures; rewritten commits will be unsigned."
 		result.Warnings = append(result.Warnings, w)
 		r.warn(w)
@@ -236,13 +240,21 @@ func (r *Rewriter) Run(ctx context.Context, inputs ...Input) (*Result, error) {
 		r.warn(w)
 	}
 
-	if w := r.handoffCommitMap(bareCommitMap); w != "" {
-		result.Warnings = append(result.Warnings, w)
-		r.warn(w)
-	}
-	if r.wd.HasCommitMap() {
-		if n, err := filterrepo.CountCommitsRemapped(r.wd.CommitMap()); err == nil {
-			result.CommitsRemapped = n
+	// Hand off the commit-map whenever filter-repo produced one — or the
+	// source already carries one (e.g. an empty map for a no-rewrite repo)
+	// — so the downstream remap can run. A pure no-op with no source map
+	// produces none, and we stay silent rather than warn misleadingly.
+	srcInfo, srcErr := os.Stat(bareCommitMap)
+	srcCommitMap := srcErr == nil && !srcInfo.IsDir()
+	if srcCommitMap || rewriteRan {
+		if w := r.handoffCommitMap(bareCommitMap); w != "" {
+			result.Warnings = append(result.Warnings, w)
+			r.warn(w)
+		}
+		if r.wd.HasCommitMap() {
+			if n, err := filterrepo.CountCommitsRemapped(r.wd.CommitMap()); err == nil {
+				result.CommitsRemapped = n
+			}
 		}
 	}
 
@@ -319,27 +331,31 @@ func wrapFindBareRepoError(root string, err error) error {
 	}
 }
 
-func (r *Rewriter) runStrip(ctx context.Context, bareRepoPath string, result *Result) error {
+// prepareStrip analyzes large files, writes cleanup.txt, prints the table, and
+// runs Gate-1 confirmation. It does NOT run filter-repo (the strip is folded
+// into Run); StripPerformed is set by the caller after the rewrite succeeds.
+// Returns the cleanup.txt path to feed Run, or "" when nothing is flagged.
+func (r *Rewriter) prepareStrip(ctx context.Context, bareRepoPath string, result *Result) (string, error) {
 	report, err := r.analyzer.Analyze(ctx, bareRepoPath)
 	if err != nil {
-		return fmt.Errorf("analyze large files: %w", err)
+		return "", fmt.Errorf("analyze large files: %w", err)
 	}
 	if len(report.Flagged) == 0 {
 		r.info("no files exceed threshold; nothing to strip")
-		return nil
+		return "", nil
 	}
 	if err := report.WriteCleanupFile(r.wd.CleanupTxt()); err != nil {
-		return fmt.Errorf("write cleanup.txt: %w", err)
+		return "", fmt.Errorf("write cleanup.txt: %w", err)
 	}
 	r.printFlaggedTable(report)
 
 	// Gate 1.
 	if !r.cfg.SkipConfirm {
 		if r.cfg.NonInteractive {
-			return errors.New("--yes required to strip files when --non-interactive is set")
+			return "", errors.New("--yes required to strip files when --non-interactive is set")
 		}
 		if !r.isTTY() {
-			return errors.New("--yes required to strip files when not running on a TTY")
+			return "", errors.New("--yes required to strip files when not running on a TTY")
 		}
 		prompt := fmt.Sprintf(
 			"Strip these %d paths from history? This rewrites all commits.",
@@ -347,17 +363,13 @@ func (r *Rewriter) runStrip(ctx context.Context, bareRepoPath string, result *Re
 		)
 		ok, err := r.confirm(prompt, false)
 		if err != nil {
-			return fmt.Errorf("confirmation prompt failed: %w", err)
+			return "", fmt.Errorf("confirmation prompt failed: %w", err)
 		}
 		if !ok {
-			return errors.New("rewrite aborted by user")
+			return "", errors.New("rewrite aborted by user")
 		}
 	}
 
-	if err := r.runner.StripPaths(ctx, bareRepoPath, r.wd.CleanupTxt()); err != nil {
-		return fmt.Errorf("filter-repo strip: %w", err)
-	}
-	result.StripPerformed = true
 	for _, f := range report.Flagged {
 		result.PathsStripped = append(result.PathsStripped, f.Path)
 		fp := f.Footprint()
@@ -366,18 +378,29 @@ func (r *Rewriter) runStrip(ctx context.Context, bareRepoPath string, result *Re
 			result.LargestStripped = fp
 		}
 	}
-	return nil
+	return r.wd.CleanupTxt(), nil
 }
 
+// checks flags for scripts and duplicate flags before any rewrite work
 func (r *Rewriter) validateScripts() error {
 	seen := map[string]string{}
+	for name := range filterrepo.PassthroughCallbackKinds(r.cfg.FilterRepoFlags) {
+		seen[name] = "--filter-repo-flag " + name
+	}
 	for _, p := range r.cfg.FilterRepoScripts {
 		kind, err := filterrepo.CallbackKindFor(p)
 		if err != nil {
 			return err
 		}
 		if other, dup := seen[kind]; dup {
-			return fmt.Errorf("duplicate %s scripts: %s and %s", kind, other, p)
+			return fmt.Errorf("duplicate %s callback: %s and %s", kind, other, p)
+		}
+		info, err := os.Lstat(p)
+		if err != nil {
+			return fmt.Errorf("callback script %s: %w", p, err)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("callback script %s: not a regular file", p)
 		}
 		seen[kind] = p
 	}
@@ -442,12 +465,25 @@ func (r *Rewriter) handoffCommitMap(srcCommitMap string) string {
 
 // sanitizeUserFlags returns the argv tokens with any embedded callback
 // body redacted. We never log or surface user-supplied script bodies.
+// Both forms are handled: the inline "--x-callback=<body>" and the
+// two-token "--x-callback <body>" (where the body is the following token).
 func sanitizeUserFlags(flags []string) []string {
 	out := make([]string, 0, len(flags))
+	skipNext := false
 	for _, t := range flags {
+		if skipNext {
+			out = append(out, "<redacted>")
+			skipNext = false
+			continue
+		}
+		if strings.HasPrefix(t, "--") && strings.HasSuffix(t, "-callback") {
+			out = append(out, t)
+			skipNext = true
+			continue
+		}
 		if i := strings.IndexByte(t, '='); i >= 0 {
 			name := t[:i]
-			if strings.HasSuffix(name, "-callback") {
+			if strings.HasPrefix(name, "--") && strings.HasSuffix(name, "-callback") {
 				out = append(out, name+"=<redacted>")
 				continue
 			}

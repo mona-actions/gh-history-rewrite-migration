@@ -1,13 +1,11 @@
 // Package largefiles implements the analyze → flag → cleanup workflow for
 // removing oversized blobs from git history before migration.
 //
-// It builds on internal/filterrepo: the Analyzer struct calls
-// filterrepo.Runner.Analyze, applies a max+cumulative threshold rule, and
-// produces both an in-memory Report and the cleanup.txt file consumed by
-// filterrepo.Runner.StripPaths.
+// The Analyzer calls filterrepo.Runner.Analyze, applies a max+cumulative
+// threshold, and produces a Report plus the cleanup.txt that
+// filterrepo.Runner.Run consumes via CombinedOpts.PathsFromFile.
 //
-// This package is library-only — it registers no cobra commands. The
-// rewrite/migrate orchestrators wire it up.
+// Library-only: it registers no cobra commands.
 package largefiles
 
 import (
@@ -124,12 +122,9 @@ func (a *Analyzer) report(res *filterrepo.AnalyzeResult) *Report {
 	return rep
 }
 
-// WriteCleanupFile writes one flagged path per line to dest in the order
-// they appear in r.Flagged. The resulting file is suitable as the
-// --paths-from-file argument for filterrepo.Runner.StripPaths.
-//
-// An empty Flagged slice still writes an empty file — callers should
-// short-circuit before calling if that is undesirable.
+// WriteCleanupFile writes one flagged path per line to dest (the order in
+// r.Flagged), suitable as Run's --paths-from-file. An empty Flagged slice
+// writes an empty file — callers should short-circuit if that's undesirable.
 func (r *Report) WriteCleanupFile(dest string) error {
 	if r == nil {
 		return errors.New("largefiles: report is nil")

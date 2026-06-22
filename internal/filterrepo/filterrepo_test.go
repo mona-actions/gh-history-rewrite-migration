@@ -97,6 +97,29 @@ func TestValidateUserFlags_NonFlagTokensIgnored(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestValidateUserFlags_FlagLikeCallbackBodyNotMisread(t *testing.T) {
+	// A two-token callback whose body happens to look like a reserved or
+	// path-family flag must be treated as a body, not validated as a flag.
+	require.NoError(t, ValidateUserFlags([]string{"--commit-callback", "--force"}, false))
+	require.NoError(t, ValidateUserFlags([]string{"--commit-callback", "--invert-paths"}, true))
+	// A flag-like body must not seed a false duplicate against a later kind.
+	require.NoError(t, ValidateUserFlags([]string{"--commit-callback", "--blob-callback", "--email-callback", "x"}, false))
+}
+
+func TestPassthroughCallbackKinds(t *testing.T) {
+	// Inline and two-token callback flags are collected; bodies (even
+	// flag-like ones) are skipped; non-callback flags are ignored.
+	got := PassthroughCallbackKinds([]string{
+		"--commit-callback", "--blob-callback", // body is flag-like, must be skipped
+		"--email-callback=lower()", // inline form
+		"--refs", "main",
+	})
+	assert.Equal(t, map[string]bool{
+		"--commit-callback": true,
+		"--email-callback":  true,
+	}, got)
+}
+
 func TestCallbackKindFor_AllSuffixes(t *testing.T) {
 	cases := map[string]string{
 		"x.commit-callback.py":   "--commit-callback",
@@ -129,31 +152,7 @@ func TestCallbackKindFor_PathPrefix(t *testing.T) {
 	assert.Equal(t, "--email-callback", got)
 }
 
-func TestRunCallbackScripts_DuplicateKindAcrossFiles(t *testing.T) {
-	dir := t.TempDir()
-	a := filepath.Join(dir, "a.commit-callback.py")
-	b := filepath.Join(dir, "b.commit-callback.py")
-	require.NoError(t, os.WriteFile(a, []byte("# a"), 0o644))
-	require.NoError(t, os.WriteFile(b, []byte("# b"), 0o644))
-
-	r := New(&fakeExecer{}, nil)
-	err := r.RunCallbackScripts(context.Background(), dir, []string{a, b})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "duplicate")
-}
-
-func TestRunCallbackScripts_UnknownSuffix(t *testing.T) {
-	dir := t.TempDir()
-	bad := filepath.Join(dir, "noop.py")
-	require.NoError(t, os.WriteFile(bad, []byte(""), 0o644))
-
-	r := New(&fakeExecer{}, nil)
-	err := r.RunCallbackScripts(context.Background(), dir, []string{bad})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "unknown callback kind")
-}
-
-func TestRunCallbackScripts_PassesBodyAndPath(t *testing.T) {
+func TestRun_AssemblesSingleInvocation(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "fixmail.email-callback.py")
 	const body = "# secret-looking content"
@@ -161,13 +160,151 @@ func TestRunCallbackScripts_PassesBodyAndPath(t *testing.T) {
 
 	exec := &fakeExecer{}
 	r := New(exec, nil)
-	err := r.RunCallbackScripts(context.Background(), dir, []string{script})
+	err := r.Run(context.Background(), dir, CombinedOpts{
+		StripActive:      true,
+		PathsFromFile:    "/tmp/cleanup.txt",
+		ScriptPaths:      []string{script},
+		PassthroughFlags: []string{"--refs", "main"},
+	})
+	require.NoError(t, err)
+	require.Len(t, exec.calls, 1, "exactly one filter-repo invocation")
+	args := exec.calls[0]
+	assert.Equal(t, []string{
+		"git", "filter-repo", "--force",
+		"--invert-paths", "--paths-from-file", "/tmp/cleanup.txt",
+		"--email-callback", body,
+		"--refs", "main",
+	}, args)
+}
+
+func TestRun_StripOnly(t *testing.T) {
+	exec := &fakeExecer{}
+	r := New(exec, nil)
+	err := r.Run(context.Background(), "/tmp/repo.git", CombinedOpts{
+		StripActive:   true,
+		PathsFromFile: "/tmp/cleanup.txt",
+	})
 	require.NoError(t, err)
 	require.Len(t, exec.calls, 1)
-	args := exec.calls[0]
-	// Args: [git filter-repo --force --email-callback <body>]
-	assert.Contains(t, args, "--email-callback")
-	assert.Contains(t, args, body)
+	assert.Equal(t, []string{
+		"git", "filter-repo", "--force", "--invert-paths", "--paths-from-file", "/tmp/cleanup.txt",
+	}, exec.calls[0])
+}
+
+func TestRun_FlagsOnly(t *testing.T) {
+	exec := &fakeExecer{}
+	r := New(exec, nil)
+	err := r.Run(context.Background(), "/tmp", CombinedOpts{
+		PassthroughFlags: []string{"--refs", "main"},
+	})
+	require.NoError(t, err)
+	require.Len(t, exec.calls, 1)
+	assert.Equal(t, []string{"git", "filter-repo", "--force", "--refs", "main"}, exec.calls[0])
+}
+
+func TestRun_RejectsReservedFlag(t *testing.T) {
+	exec := &fakeExecer{}
+	r := New(exec, nil)
+	err := r.Run(context.Background(), "/tmp", CombinedOpts{
+		PassthroughFlags: []string{"--force"},
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "--force")
+	assert.Empty(t, exec.calls)
+}
+
+func TestRun_RejectsStripBlockedPathFamily(t *testing.T) {
+	exec := &fakeExecer{}
+	r := New(exec, nil)
+	err := r.Run(context.Background(), "/tmp", CombinedOpts{
+		StripActive:      true,
+		PathsFromFile:    "/tmp/cleanup.txt",
+		PassthroughFlags: []string{"--invert-paths"},
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "--invert-paths")
+	assert.Empty(t, exec.calls)
+}
+
+func TestRun_UnknownSuffix(t *testing.T) {
+	dir := t.TempDir()
+	bad := filepath.Join(dir, "noop.py")
+	require.NoError(t, os.WriteFile(bad, []byte(""), 0o644))
+
+	exec := &fakeExecer{}
+	r := New(exec, nil)
+	err := r.Run(context.Background(), dir, CombinedOpts{ScriptPaths: []string{bad}})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unknown callback kind")
+	assert.Empty(t, exec.calls)
+}
+
+func TestRun_DuplicateKindAcrossScripts(t *testing.T) {
+	dir := t.TempDir()
+	a := filepath.Join(dir, "a.commit-callback.py")
+	b := filepath.Join(dir, "b.commit-callback.py")
+	require.NoError(t, os.WriteFile(a, []byte("# a"), 0o644))
+	require.NoError(t, os.WriteFile(b, []byte("# b"), 0o644))
+
+	exec := &fakeExecer{}
+	r := New(exec, nil)
+	err := r.Run(context.Background(), dir, CombinedOpts{ScriptPaths: []string{a, b}})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "duplicate")
+	assert.Empty(t, exec.calls)
+}
+
+func TestRun_DuplicateKindAcrossScriptAndFlag(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "a.commit-callback.py")
+	require.NoError(t, os.WriteFile(script, []byte("# a"), 0o644))
+
+	exec := &fakeExecer{}
+	r := New(exec, nil)
+	err := r.Run(context.Background(), dir, CombinedOpts{
+		ScriptPaths:      []string{script},
+		PassthroughFlags: []string{"--commit-callback=return commit"},
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "duplicate")
+	assert.Contains(t, err.Error(), "--commit-callback")
+	assert.Empty(t, exec.calls)
+}
+
+func TestRun_NeverLogsBody(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "x.commit-callback.py")
+	const secretBody = "TOTALLY-SECRET-CALLBACK-BODY"
+	require.NoError(t, os.WriteFile(script, []byte(secretBody), 0o644))
+
+	rec := &recordingLogger{}
+	r := New(&fakeExecer{}, rec)
+	err := r.Run(context.Background(), dir, CombinedOpts{ScriptPaths: []string{script}})
+	require.NoError(t, err)
+
+	for _, msg := range rec.msgs {
+		assert.False(t, strings.Contains(msg, secretBody),
+			"logger should never see callback script body, got: %q", msg)
+	}
+}
+
+func TestRun_PropagatesExecError(t *testing.T) {
+	r := New(&fakeExecer{runErr: errors.New("boom")}, nil)
+	err := r.Run(context.Background(), "/tmp", CombinedOpts{
+		PassthroughFlags: []string{"--refs", "main"},
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "boom")
+}
+
+func TestRun_MissingScriptErrors(t *testing.T) {
+	exec := &fakeExecer{}
+	r := New(exec, nil)
+	err := r.Run(context.Background(), "/tmp", CombinedOpts{
+		ScriptPaths: []string{filepath.Join(t.TempDir(), "missing.commit-callback.py")},
+	})
+	require.Error(t, err)
+	assert.Empty(t, exec.calls)
 }
 
 func TestRedactForLog(t *testing.T) {
@@ -179,71 +316,6 @@ func TestRedactForLog(t *testing.T) {
 
 	got = redactForLog([]string{"filter-repo", "--partial", "--refs", "main"})
 	assert.Equal(t, "filter-repo --partial --refs main", got)
-}
-
-func TestRun_RejectsReservedFlag(t *testing.T) {
-	r := New(&fakeExecer{}, nil)
-	err := r.Run(context.Background(), "/tmp", []string{"--force"})
-	require.Error(t, err)
-}
-
-func TestRun_PassesArgs(t *testing.T) {
-	exec := &fakeExecer{}
-	r := New(exec, nil)
-	err := r.Run(context.Background(), "/tmp", []string{"--refs", "main"})
-	require.NoError(t, err)
-	require.Len(t, exec.calls, 1)
-	assert.Equal(t, []string{"git", "filter-repo", "--force", "--refs", "main"}, exec.calls[0])
-}
-
-func TestRunAndRunCallbackScripts_IncludeForce(t *testing.T) {
-	t.Run("Run", func(t *testing.T) {
-		exec := &fakeExecer{}
-		r := New(exec, nil)
-
-		err := r.Run(context.Background(), "/tmp", []string{"--refs", "main"})
-		require.NoError(t, err)
-		require.Len(t, exec.calls, 1)
-		assert.Equal(t, []string{"git", "filter-repo", "--force", "--refs", "main"}, exec.calls[0])
-	})
-
-	t.Run("RunCallbackScripts", func(t *testing.T) {
-		dir := t.TempDir()
-		script := filepath.Join(dir, "fixmail.email-callback.py")
-		require.NoError(t, os.WriteFile(script, []byte("return email"), 0o644))
-
-		exec := &fakeExecer{}
-		r := New(exec, nil)
-
-		err := r.RunCallbackScripts(context.Background(), dir, []string{script})
-		require.NoError(t, err)
-		require.Len(t, exec.calls, 1)
-		assert.Equal(t, []string{"git", "filter-repo", "--force"}, exec.calls[0][:3])
-	})
-}
-
-func TestStripPaths_Args(t *testing.T) {
-	exec := &fakeExecer{}
-	r := New(exec, nil)
-	err := r.StripPaths(context.Background(), "/tmp/repo.git", "/tmp/cleanup.txt")
-	require.NoError(t, err)
-	require.Len(t, exec.calls, 1)
-	assert.Equal(t, []string{
-		"git", "filter-repo", "--invert-paths", "--paths-from-file", "/tmp/cleanup.txt", "--force",
-	}, exec.calls[0])
-}
-
-func TestStripPaths_RequiresPath(t *testing.T) {
-	r := New(&fakeExecer{}, nil)
-	err := r.StripPaths(context.Background(), "/tmp", "")
-	require.Error(t, err)
-}
-
-func TestRun_PropagatesExecError(t *testing.T) {
-	r := New(&fakeExecer{runErr: errors.New("boom")}, nil)
-	err := r.Run(context.Background(), "/tmp", []string{"--refs", "main"})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "boom")
 }
 
 // --- Analyze parsing -------------------------------------------------------
@@ -338,24 +410,6 @@ func TestParseSizesFile_SkipsHeaderLines(t *testing.T) {
 func TestExtractPathColumn_HandlesSpaces(t *testing.T) {
 	got := extractPathColumn("       10240           5120 <none>     dir with spaces/file.bin")
 	assert.Equal(t, "dir with spaces/file.bin", got)
-}
-
-func TestRunCallbackScripts_NeverLogsBody(t *testing.T) {
-	// Ensure the logger receives only paths/flags, never script contents.
-	dir := t.TempDir()
-	script := filepath.Join(dir, "x.commit-callback.py")
-	const secretBody = "TOTALLY-SECRET-CALLBACK-BODY"
-	require.NoError(t, os.WriteFile(script, []byte(secretBody), 0o644))
-
-	rec := &recordingLogger{}
-	r := New(&fakeExecer{}, rec)
-	err := r.RunCallbackScripts(context.Background(), dir, []string{script})
-	require.NoError(t, err)
-
-	for _, msg := range rec.msgs {
-		assert.False(t, strings.Contains(msg, secretBody),
-			"logger should never see callback script body, got: %q", msg)
-	}
 }
 
 type recordingLogger struct{ msgs []string }

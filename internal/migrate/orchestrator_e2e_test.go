@@ -320,9 +320,16 @@ func realFixtureArchives(t *testing.T) e2eArchives {
 	t.Helper()
 	root := findRepoRoot(t)
 	fixtureDir := filepath.Join(root, "internal", "testdata", "gei-real")
+	gitArchive := filepath.Join(fixtureDir, "git-archive.tar.gz")
+	metadataArchive := filepath.Join(fixtureDir, "metadata-archive.tar.gz")
+	for _, f := range []string{gitArchive, metadataArchive} {
+		if _, err := os.Stat(f); err != nil {
+			t.Skipf("real GEI fixture not present (%s); this is a local-only, gitignored fixture — skipping", f)
+		}
+	}
 	return e2eArchives{
-		git:      mustReadFile(t, filepath.Join(fixtureDir, "git-archive.tar.gz")),
-		metadata: mustReadFile(t, filepath.Join(fixtureDir, "metadata-archive.tar.gz")),
+		git:      mustReadFile(t, gitArchive),
+		metadata: mustReadFile(t, metadataArchive),
 	}
 }
 
