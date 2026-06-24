@@ -188,7 +188,7 @@ func (r *Runner) runPreRewritePipeline(ctx context.Context, bareRepoPath string,
 	r.info(fmt.Sprintf("running pre-rewrite pipeline: git %s | %d script(s) | git %s",
 		strings.Join(preRewriteFastExportArgs, " "),
 		len(absScripts),
-		redactForLog(append(filterRepoArgs[1:], "--stdin"))))
+		redactForLog(append(append([]string{}, filterRepoArgs...), "--stdin"))))
 
 	started := 0
 	for stageIdx := range stages {

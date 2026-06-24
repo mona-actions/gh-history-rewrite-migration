@@ -101,8 +101,8 @@ git filter-repo --force \
 ```
 
 When `--strip-large-files` is combined with `--filter-repo-script` or
-`--filter-repo-flag`, \*\*all operations are merged into a single
-filter-repo invocation.\*\* Multiple passes would rewrite SHAs multiple
+`--filter-repo-flag`, **all operations are merged into a single
+filter-repo invocation.** Multiple passes would rewrite SHAs multiple
 times, breaking the commit-map handoff.
 
 ---
