@@ -1,6 +1,7 @@
 package filterrepo
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"os/exec"
@@ -238,4 +239,60 @@ func TestRun_PreRewriteRejectsRefsPassthrough(t *testing.T) {
 	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "--refs")
+}
+
+// --- root-cause attribution unit tests (no git required) ---
+
+// waitErr runs a tiny shell command and returns the error from Wait, used to
+// produce genuine *exec.ExitError values (SIGPIPE-killed vs plain nonzero exit).
+func waitErr(t *testing.T, shellCmd string) error {
+	t.Helper()
+	cmd := exec.Command("sh", "-c", shellCmd)
+	return cmd.Run()
+}
+
+func TestIsBrokenPipe(t *testing.T) {
+	assert.False(t, isBrokenPipe(nil))
+	assert.False(t, isBrokenPipe(waitErr(t, "exit 3")), "plain nonzero exit is not a broken pipe")
+	assert.True(t, isBrokenPipe(waitErr(t, "kill -PIPE $$")), "SIGPIPE death is a broken pipe")
+}
+
+func TestReportPipelineFailure(t *testing.T) {
+	sigpipe := waitErr(t, "kill -PIPE $$")
+	exit3 := waitErr(t, "exit 3")
+	require.Error(t, sigpipe)
+	require.Error(t, exit3)
+
+	stages := func() []pipelineStage {
+		return []pipelineStage{
+			{name: "git fast-export", err: &bytes.Buffer{}},
+			{name: "pre-rewrite script repair.pl", err: &bytes.Buffer{}},
+			{name: "git filter-repo --stdin", err: &bytes.Buffer{}},
+		}
+	}
+
+	t.Run("all succeed", func(t *testing.T) {
+		assert.NoError(t, reportPipelineFailure(stages(), []error{nil, nil, nil}))
+	})
+
+	t.Run("script failure outranks upstream broken pipe", func(t *testing.T) {
+		// fast-export dies from SIGPIPE because the script exited early — the
+		// script is the real culprit and must be reported.
+		err := reportPipelineFailure(stages(), []error{sigpipe, exit3, sigpipe})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "pre-rewrite script repair.pl")
+		assert.NotContains(t, err.Error(), "git fast-export failed")
+	})
+
+	t.Run("sigpipe-only falls back to first failure", func(t *testing.T) {
+		err := reportPipelineFailure(stages(), []error{sigpipe, nil, nil})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "git fast-export")
+	})
+
+	t.Run("first non-sigpipe failure wins in pipeline order", func(t *testing.T) {
+		err := reportPipelineFailure(stages(), []error{exit3, exit3, nil})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "git fast-export")
+	})
 }

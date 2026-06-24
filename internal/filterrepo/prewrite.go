@@ -10,22 +10,16 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
-// preRewriteFastExportArgs are the git fast-export flags that feed the
-// pre-rewrite pipeline. They are deliberately fixed:
-//
-//   - --all: export every ref. The pre-rewrite pipeline always operates on
-//     the whole history; ref-narrowing via --refs is rejected up front (see
-//     ValidatePreRewriteFlags) precisely because this is hardcoded.
-//   - --signed-tags=strip: signatures cannot survive a rewrite anyway.
-//   - --show-original-ids: emits `original-oid <sha>` so filter-repo can build
-//     a commit-map that maps the ORIGINAL SHAs to the final ones. The
-//     downstream metadata remap depends on this; without it the map is wrong.
-//   - --reencode=no: pass commit-message bytes through unchanged.
-//   - --use-done-feature: emit a trailing `done` so a script that truncates
-//     the stream mid-way causes filter-repo to fail loudly (missing done)
-//     instead of silently importing a partial history.
+// preRewriteFastExportArgs are the fixed git fast-export flags feeding the
+// pre-rewrite pipeline:
+//   --all                always whole-history (--refs is rejected up front)
+//   --signed-tags=strip  signatures can't survive a rewrite
+//   --show-original-ids  emit original-oid lines so the commit-map is correct
+//   --reencode=no        pass message bytes through unchanged
+//   --use-done-feature   trailing `done` so a truncated stream fails loudly
 var preRewriteFastExportArgs = []string{
 	"fast-export",
 	"--all",
@@ -36,24 +30,22 @@ var preRewriteFastExportArgs = []string{
 }
 
 // scriptEnvAllowlist is the set of parent environment variables forwarded to
-// user pre-rewrite scripts. Everything else — notably the migration PATs
-// (GH_PAT, GH_SOURCE_PAT) and any cloud credentials — is withheld. LC_ALL is
-// forced to C separately so byte-level stream matching is locale-independent.
+// user pre-rewrite scripts; everything else (notably the migration PATs) is
+// withheld. LC_ALL is forced to C separately, for locale-independent matching.
 var scriptEnvAllowlist = []string{"PATH", "HOME", "LANG", "TMPDIR"}
 
 // ValidatePreRewriteScripts resolves each script to an absolute path and
-// verifies it is a regular, executable file beginning with a `#!` shebang.
-// It runs before any process starts so misconfiguration fails fast and
-// loudly rather than as an opaque mid-pipeline exec error.
+// verifies it is a regular, executable file with a `#!` shebang, so
+// misconfiguration fails fast instead of mid-pipeline.
 func ValidatePreRewriteScripts(scripts []string) ([]string, error) {
 	if len(scripts) == 0 {
 		return nil, errors.New("no pre-rewrite scripts supplied")
 	}
 	abs := make([]string, 0, len(scripts))
-	for _, s := range scripts {
-		p, err := filepath.Abs(s)
+	for _, scriptPath := range scripts {
+		p, err := filepath.Abs(scriptPath)
 		if err != nil {
-			return nil, fmt.Errorf("pre-rewrite script %q: %w", s, err)
+			return nil, fmt.Errorf("pre-rewrite script %q: %w", scriptPath, err)
 		}
 		info, err := os.Stat(p)
 		if err != nil {
@@ -93,28 +85,24 @@ func checkShebang(path string) error {
 // an allowlist of parent vars plus a forced LC_ALL=C.
 func sanitizedScriptEnv() []string {
 	env := make([]string, 0, len(scriptEnvAllowlist)+1)
-	for _, k := range scriptEnvAllowlist {
-		if v, ok := os.LookupEnv(k); ok {
-			env = append(env, k+"="+v)
+	for _, key := range scriptEnvAllowlist {
+		if v, ok := os.LookupEnv(key); ok {
+			env = append(env, key+"="+v)
 		}
 	}
 	env = append(env, "LC_ALL=C")
 	return env
 }
 
-// gitPipelineEnv returns the environment for the orchestrator's own git
-// processes (fast-export, filter-repo). Unlike user scripts these are trusted,
-// so they inherit the full parent environment; LC_ALL=C is appended last to
-// guarantee byte-faithful, locale-independent stream handling.
+// gitPipelineEnv returns the environment for the orchestrator's own trusted git
+// processes: the full parent environment plus a forced LC_ALL=C.
 func gitPipelineEnv() []string {
 	return append(os.Environ(), "LC_ALL=C")
 }
 
-// ValidatePreRewriteFlags rejects passthrough flags that are
-// incompatible with the pre-rewrite stdin pipeline. The pipeline hardcodes
-// `git fast-export --all`, so a ref-narrowing flag would silently fail to
-// constrain the exported history and could rewrite more than the operator
-// intended.
+// ValidatePreRewriteFlags rejects passthrough flags incompatible with the
+// pre-rewrite pipeline. It hardcodes `git fast-export --all`, so a ref-narrowing
+// flag would silently fail to constrain the exported history.
 func ValidatePreRewriteFlags(flags []string) error {
 	for _, raw := range flags {
 		if flagName(raw) == "--refs" {
@@ -124,59 +112,57 @@ func ValidatePreRewriteFlags(flags []string) error {
 	return nil
 }
 
+// pipelineStage is one process in the fast-export | scripts | filter-repo chain.
+type pipelineStage struct {
+	name string
+	cmd  *exec.Cmd
+	err  *bytes.Buffer
+}
+
 // runPreRewritePipeline wires
 //
 //	git fast-export <fixed args> | script1 | … | git filter-repo --stdin <filterRepoArgs>
 //
-// as separate processes connected by OS pipes (no shell), runs them
-// concurrently, and reports the FIRST failing stage in pipeline order so a
-// genuine upstream error (e.g. a script crash) is surfaced instead of the
-// downstream broken-pipe it triggers.
-//
-// filterRepoArgs is the already-assembled `["filter-repo", "--force", …]`
-// argument list from Run; this function prepends the bare-repo config
-// guard and appends `--stdin`.
+// as separate processes connected by OS pipes (no shell). filterRepoArgs is the
+// assembled list from Run; this prepends the bare-repo config guard and appends
+// `--stdin`.
 func (r *Runner) runPreRewritePipeline(ctx context.Context, bareRepoPath string, filterRepoArgs, scripts []string) error {
 	absScripts, err := ValidatePreRewriteScripts(scripts)
 	if err != nil {
 		return err
 	}
 
-	// Stage commands, in pipeline order.
 	exportArgs := append([]string{"-c", "safe.bareRepository=all"}, preRewriteFastExportArgs...)
 	frArgs := append([]string{"-c", "safe.bareRepository=all"}, filterRepoArgs...)
 	frArgs = append(frArgs, "--stdin")
 
-	type stage struct {
-		name string
-		cmd  *exec.Cmd
-		err  *bytes.Buffer
-	}
-	stages := make([]stage, 0, len(absScripts)+2)
+	stages := make([]pipelineStage, 0, len(absScripts)+2)
 
-	feCmd := exec.CommandContext(ctx, r.bin, exportArgs...)
-	feCmd.Dir = bareRepoPath
-	feCmd.Env = gitPipelineEnv()
-	stages = append(stages, stage{name: "git fast-export", cmd: feCmd})
+	// First stage: export the whole history as a fast-import byte stream.
+	exportCmd := exec.CommandContext(ctx, r.bin, exportArgs...)
+	exportCmd.Dir = bareRepoPath
+	exportCmd.Env = gitPipelineEnv()
+	stages = append(stages, pipelineStage{name: "git fast-export", cmd: exportCmd})
 
-	for _, s := range absScripts {
-		sc := exec.CommandContext(ctx, s)
-		sc.Dir = bareRepoPath
-		sc.Env = sanitizedScriptEnv()
-		stages = append(stages, stage{name: "pre-rewrite script " + filepath.Base(s), cmd: sc})
+	// Middle stages: each user script filters the stream in turn.
+	for _, scriptPath := range absScripts {
+		scriptCmd := exec.CommandContext(ctx, scriptPath)
+		scriptCmd.Dir = bareRepoPath
+		scriptCmd.Env = sanitizedScriptEnv()
+		stages = append(stages, pipelineStage{name: "pre-rewrite script " + filepath.Base(scriptPath), cmd: scriptCmd})
 	}
 
-	frCmd := exec.CommandContext(ctx, r.bin, frArgs...)
-	frCmd.Dir = bareRepoPath
-	frCmd.Env = gitPipelineEnv()
-	stages = append(stages, stage{name: "git filter-repo --stdin", cmd: frCmd})
+	// Last stage: filter-repo re-imports the repaired stream and rewrites history.
+	filterRepoCmd := exec.CommandContext(ctx, r.bin, frArgs...)
+	filterRepoCmd.Dir = bareRepoPath
+	filterRepoCmd.Env = gitPipelineEnv()
+	stages = append(stages, pipelineStage{name: "git filter-repo --stdin", cmd: filterRepoCmd})
 
-	// Capture each stage's stderr; the last stage's stdout is forwarded to
-	// the runner's stdout (filter-repo progress/output).
-	for i := range stages {
+	// Capture each stage's stderr; forward the last stage's stdout to the runner.
+	for stageIdx := range stages {
 		buf := &bytes.Buffer{}
-		stages[i].err = buf
-		stages[i].cmd.Stderr = buf
+		stages[stageIdx].err = buf
+		stages[stageIdx].cmd.Stderr = buf
 	}
 	stages[len(stages)-1].cmd.Stdout = r.stdout
 
@@ -188,13 +174,13 @@ func (r *Runner) runPreRewritePipeline(ctx context.Context, bareRepoPath string,
 			_ = f.Close()
 		}
 	}()
-	for i := 0; i < len(stages)-1; i++ {
+	for stageIdx := 0; stageIdx < len(stages)-1; stageIdx++ {
 		pr, pw, perr := os.Pipe()
 		if perr != nil {
 			return fmt.Errorf("pre-rewrite pipeline: create pipe: %w", perr)
 		}
-		stages[i].cmd.Stdout = pw
-		stages[i+1].cmd.Stdin = pr
+		stages[stageIdx].cmd.Stdout = pw
+		stages[stageIdx+1].cmd.Stdin = pr
 		toClose = append(toClose, pr, pw)
 	}
 
@@ -204,15 +190,15 @@ func (r *Runner) runPreRewritePipeline(ctx context.Context, bareRepoPath string,
 		redactForLog(append(filterRepoArgs[1:], "--stdin"))))
 
 	started := 0
-	for i := range stages {
-		if serr := stages[i].cmd.Start(); serr != nil {
+	for stageIdx := range stages {
+		if serr := stages[stageIdx].cmd.Start(); serr != nil {
 			// Best-effort: kill anything already started before bailing.
-			for j := 0; j < started; j++ {
-				if stages[j].cmd.Process != nil {
-					_ = stages[j].cmd.Process.Kill()
+			for startedIdx := 0; startedIdx < started; startedIdx++ {
+				if stages[startedIdx].cmd.Process != nil {
+					_ = stages[startedIdx].cmd.Process.Kill()
 				}
 			}
-			return fmt.Errorf("pre-rewrite pipeline: start %s: %w", stages[i].name, serr)
+			return fmt.Errorf("pre-rewrite pipeline: start %s: %w", stages[stageIdx].name, serr)
 		}
 		started++
 	}
@@ -226,16 +212,47 @@ func (r *Runner) runPreRewritePipeline(ctx context.Context, bareRepoPath string,
 
 	// Wait for every stage; record each result.
 	waitErrs := make([]error, len(stages))
-	for i := range stages {
-		waitErrs[i] = stages[i].cmd.Wait()
+	for stageIdx := range stages {
+		waitErrs[stageIdx] = stages[stageIdx].cmd.Wait()
 	}
+	return reportPipelineFailure(stages, waitErrs)
+}
 
-	// Report the first failing stage in pipeline order.
-	for i := range stages {
-		if waitErrs[i] != nil {
-			return fmt.Errorf("pre-rewrite pipeline: %s failed: %w (stderr=%q)",
-				stages[i].name, waitErrs[i], strings.TrimSpace(stages[i].err.String()))
+// reportPipelineFailure returns the root-cause error among the stage results.
+// A SIGPIPE death is usually a victim of a downstream stage exiting early, so it
+// prefers the first non-SIGPIPE failure and falls back to a SIGPIPE one only if
+// every failure was a broken pipe.
+func reportPipelineFailure(stages []pipelineStage, waitErrs []error) error {
+	firstFail := -1
+	for stageIdx := range stages {
+		if waitErrs[stageIdx] == nil {
+			continue
+		}
+		if firstFail == -1 {
+			firstFail = stageIdx
+		}
+		if !isBrokenPipe(waitErrs[stageIdx]) {
+			return stageError(stages[stageIdx].name, waitErrs[stageIdx], stages[stageIdx].err)
 		}
 	}
+	if firstFail != -1 {
+		return stageError(stages[firstFail].name, waitErrs[firstFail], stages[firstFail].err)
+	}
 	return nil
+}
+
+func stageError(name string, err error, stderr *bytes.Buffer) error {
+	return fmt.Errorf("pre-rewrite pipeline: %s failed: %w (stderr=%q)",
+		name, err, strings.TrimSpace(stderr.String()))
+}
+
+// isBrokenPipe reports whether a process was terminated by SIGPIPE, which
+// happens when it writes to a pipe whose downstream reader has already exited.
+func isBrokenPipe(err error) bool {
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) {
+		return false
+	}
+	ws, ok := ee.Sys().(syscall.WaitStatus)
+	return ok && ws.Signaled() && ws.Signal() == syscall.SIGPIPE
 }

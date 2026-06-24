@@ -450,19 +450,8 @@ type CombinedOpts struct {
 	// validated via ValidateUserFlags.
 	PassthroughFlags []string
 
-	// PreRewriteScripts are user-supplied executables that filter the raw
-	// `git fast-export` byte stream BEFORE filter-repo parses it. When
-	// non-empty, Run switches from operating on the bare repo
-	// directly to the stdin form:
-	//
-	//   git fast-export --all … | <script…> | git filter-repo --stdin <args>
-	//
-	// This is the only place a malformed object that crashes filter-repo's
-	// parser (e.g. a bad author ident) can be repaired. The same strip /
-	// callback / passthrough args are appended to the filter-repo stage, so
-	// a single commit-map (original→final) is still produced. Scripts are
-	// validated (regular + executable + shebang) and run with a sanitized
-	// environment; see runPreRewritePipeline.
+	// PreRewriteScripts filter the raw fast-export stream before filter-repo
+	// parses it — the only place a parser-crashing object can be repaired.
 	PreRewriteScripts []string
 }
 

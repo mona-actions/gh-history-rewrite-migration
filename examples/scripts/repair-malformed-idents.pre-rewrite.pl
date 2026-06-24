@@ -2,69 +2,10 @@
 #
 # repair-malformed-idents.pre-rewrite.pl
 #
-# Usage:
-#   gh history-rewrite-migration migrate \
-#       --org <src> --repo <repo> --target-org <dst> \
-#       --pre-rewrite-script ./examples/scripts/repair-malformed-idents.pre-rewrite.pl
-#
-# What this does
-# --------------
-# This is a *pre-rewrite* script: unlike the eight `--filter-repo-script`
-# callbacks (which run *inside* git filter-repo's parse loop), a pre-rewrite
-# script filters the raw `git fast-export` byte stream *before* filter-repo
-# parses it. The orchestrator runs it as:
-#
-#   LC_ALL=C git fast-export --all --signed-tags=strip \
-#       --show-original-ids --reencode=no --use-done-feature \
-#     | <this script> \
-#     | git filter-repo --stdin --force [...]
-#
-# It exists because some commits carry malformed author/committer idents that
-# crash filter-repo's parser (and git fast-import) *before* any callback can
-# run, e.g. an Outlook "mailto:" hyperlink artifact embedded in the ident:
-#
-#   Pat Doe <pat.doe@example.com <mailto:pat.doe@example.com> 1452345014 +0530
-#                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-#   -> fatal: Missing > in ident string   (git fsck: badEmail)
-#
-# A valid raw ident line is:
-#
-#   <role> <name> <email-in-angle-brackets> <unix-timestamp> <tz-offset>
-#   e.g.  author Pat Doe <pat.doe@example.com> 1452345014 +0530
-#
-# This script rebuilds a clean `Name <email>` for author/committer/tagger
-# lines whose ident contains a recoverable email address.
-#
-# Why a stream filter (and not a callback)
-# ----------------------------------------
-# filter-repo parses the fast-export stream into objects, runs callbacks, then
-# re-serializes. The malformed ident breaks that *parse* step, so the callback
-# never sees it. Fixing the raw stream first is the only place the repair can
-# happen.
-#
-# Correctness guarantees this script upholds
-# ------------------------------------------
-#   * BYTE-ORIENTED. binmode on both handles; no UTF-8 decoding. fast-export
-#     streams contain arbitrary bytes (paths, names, blob/message payloads),
-#     so decoding as text would corrupt history.
-#   * RESPECTS `data <N>` FRAMING. Blob contents, commit messages and tag
-#     messages are emitted as length-prefixed `data <N>\n<N bytes>` blocks.
-#     We copy those N bytes through verbatim so a line *inside* a file that
-#     happens to start with "author " / "committer " is never mistaken for an
-#     ident command. (A naive line filter corrupted blobs in exactly this way.)
-#   * ONLY TOUCHES ident command lines (`author `/`committer `/`tagger `).
-#   * FAILS CLOSED. If an ident has no recoverable email, the line is passed
-#     through UNCHANGED rather than fabricating an address. filter-repo / fsck
-#     then surface it loudly instead of silently inventing an identity.
-#   * PRESERVES STRUCTURE. Every other line (feature/mark/from/merge/reset/
-#     tag/commit/original-oid/done/...) is passed through untouched, so the
-#     commit-map's original->final SHA mapping stays intact for the downstream
-#     metadata remap.
-#
-# Adjust to taste: this repairs the known Outlook "<mailto:...>" shape and any
-# ident from which a single email is recoverable. It deliberately does NOT
-# synthesize emails for idents with none (some sites want a "<user>@<corp>"
-# fallback — add it here if that matches your policy, but keep it explicit).
+# Repairs malformed author/committer/tagger idents that crash filter-repo's
+# parser (e.g. an Outlook "<mailto:...>" artifact). Idents with a recoverable
+# email are rebuilt as a clean `Name <email>`; idents without one pass through
+# unchanged. See docs/pre-rewrite-scripts.md for usage and the full contract.
 
 use strict;
 use warnings;

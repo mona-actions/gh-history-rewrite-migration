@@ -59,10 +59,9 @@ type Config struct {
 	// FilterRepoFlags is a list of raw filter-repo argv tokens to pass
 	// through. They are validated against filterrepo.ValidateUserFlags.
 	FilterRepoFlags []string
-	// PreRewriteScripts is a list of paths to user-supplied executables
-	// that filter the raw `git fast-export` stream before filter-repo
-	// parses it. When non-empty, the rewrite runs via the stdin pipeline
-	// form (see filterrepo.CombinedOpts.PreRewriteScripts).
+	// PreRewriteScripts are user-supplied executables that filter the raw
+	// `git fast-export` stream before filter-repo parses it; non-empty means
+	// the rewrite uses the stdin pipeline form.
 	PreRewriteScripts []string
 	// SkipConfirm bypasses the Gate-1 confirmation prompt before strip.
 	SkipConfirm bool
@@ -227,10 +226,8 @@ func (r *Rewriter) Run(ctx context.Context, inputs ...Input) (*Result, error) {
 			PreRewriteScripts: r.cfg.PreRewriteScripts,
 		}
 		if err := r.runner.Run(ctx, bareRepoPath, opts); err != nil {
-			// A partially-applied rewrite can leave the extracted bare repo
-			// half-mutated. Invalidate its completion sentinel so a resume
-			// re-extracts from the pristine raw archive instead of operating
-			// on corrupted state.
+			// A failed rewrite can leave the bare repo half-mutated; drop its
+			// completion sentinel so a resume re-extracts from the raw archive.
 			atomicfs.InvalidateDirComplete(extractDir)
 			return nil, fmt.Errorf("filter-repo rewrite: %w", err)
 		}
@@ -423,10 +420,8 @@ func (r *Rewriter) validateScripts() error {
 		seen[kind] = p
 	}
 
-	// Pre-rewrite (pre-parse stream) scripts: validate up front so a bad
-	// path / non-executable / missing-shebang fails before the Gate-1 prompt
-	// and before any history is touched. Also reject passthrough flags that
-	// are incompatible with the fast-export --all pipeline (e.g. --refs).
+	// Validate pre-rewrite scripts and flags up front, so misconfiguration
+	// fails before the Gate-1 prompt and before any history is touched.
 	if len(r.cfg.PreRewriteScripts) > 0 {
 		if _, err := filterrepo.ValidatePreRewriteScripts(r.cfg.PreRewriteScripts); err != nil {
 			return err

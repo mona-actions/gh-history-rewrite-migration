@@ -166,9 +166,8 @@ func IsDirComplete(dir string) bool {
 	return err == nil
 }
 
-// InvalidateDirComplete removes <dir>/.complete (best-effort). Use it after a
-// step mutates the directory in place and then fails, so a later resume does
-// not treat the half-written directory as complete and must re-create it.
+// InvalidateDirComplete removes <dir>/.complete (best-effort) so a later resume
+// won't treat a half-written directory as complete.
 func InvalidateDirComplete(dir string) {
 	_ = os.Remove(filepath.Join(dir, ".complete"))
 }
