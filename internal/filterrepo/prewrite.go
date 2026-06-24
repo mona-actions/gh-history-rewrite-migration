@@ -15,11 +15,12 @@ import (
 
 // preRewriteFastExportArgs are the fixed git fast-export flags feeding the
 // pre-rewrite pipeline:
-//   --all                always whole-history (--refs is rejected up front)
-//   --signed-tags=strip  signatures can't survive a rewrite
-//   --show-original-ids  emit original-oid lines so the commit-map is correct
-//   --reencode=no        pass message bytes through unchanged
-//   --use-done-feature   trailing `done` so a truncated stream fails loudly
+//
+//	--all                always whole-history (--refs is rejected up front)
+//	--signed-tags=strip  signatures can't survive a rewrite
+//	--show-original-ids  emit original-oid lines so the commit-map is correct
+//	--reencode=no        pass message bytes through unchanged
+//	--use-done-feature   trailing `done` so a truncated stream fails loudly
 var preRewriteFastExportArgs = []string{
 	"fast-export",
 	"--all",
