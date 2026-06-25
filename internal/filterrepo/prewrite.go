@@ -1,7 +1,6 @@
 package filterrepo
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -9,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 )
@@ -41,6 +41,9 @@ var scriptEnvAllowlist = []string{"PATH", "HOME", "LANG", "TMPDIR"}
 func ValidatePreRewriteScripts(scripts []string) ([]string, error) {
 	if len(scripts) == 0 {
 		return nil, errors.New("no pre-rewrite scripts supplied")
+	}
+	if runtime.GOOS == "windows" {
+		return nil, errors.New("--pre-rewrite-script is not supported on Windows (it execs shebang scripts, which is POSIX-only); run the migration from Linux, macOS, or WSL")
 	}
 	abs := make([]string, 0, len(scripts))
 	for _, scriptPath := range scripts {
@@ -117,7 +120,33 @@ func ValidatePreRewriteFlags(flags []string) error {
 type pipelineStage struct {
 	name string
 	cmd  *exec.Cmd
-	err  *bytes.Buffer
+	err  *cappedBuffer
+}
+
+// maxStageStderr caps the stderr retained per stage; 1 MiB is ample to diagnose a failure.
+const maxStageStderr = 1 << 20
+
+// cappedBuffer is an io.Writer that keeps at most maxStageStderr bytes, retaining
+// the most recent (tail) output where a fatal error message appears.
+type cappedBuffer struct {
+	buf       []byte
+	truncated bool
+}
+
+func (c *cappedBuffer) Write(p []byte) (int, error) {
+	c.buf = append(c.buf, p...)
+	if len(c.buf) > maxStageStderr {
+		c.truncated = true
+		c.buf = c.buf[len(c.buf)-maxStageStderr:] //keep only last 1MiB
+	}
+	return len(p), nil
+}
+
+func (c *cappedBuffer) String() string {
+	if c.truncated {
+		return "…[earlier stderr truncated]\n" + string(c.buf)
+	}
+	return string(c.buf)
 }
 
 // runPreRewritePipeline wires
@@ -159,9 +188,9 @@ func (r *Runner) runPreRewritePipeline(ctx context.Context, bareRepoPath string,
 	filterRepoCmd.Env = gitPipelineEnv()
 	stages = append(stages, pipelineStage{name: "git filter-repo --stdin", cmd: filterRepoCmd})
 
-	// Capture each stage's stderr; forward the last stage's stdout to the runner.
+	// Capture each stage's stderr (bounded); forward the last stage's stdout.
 	for stageIdx := range stages {
-		buf := &bytes.Buffer{}
+		buf := &cappedBuffer{}
 		stages[stageIdx].err = buf
 		stages[stageIdx].cmd.Stderr = buf
 	}
@@ -242,7 +271,7 @@ func reportPipelineFailure(stages []pipelineStage, waitErrs []error) error {
 	return nil
 }
 
-func stageError(name string, err error, stderr *bytes.Buffer) error {
+func stageError(name string, err error, stderr *cappedBuffer) error {
 	return fmt.Errorf("pre-rewrite pipeline: %s failed: %w (stderr=%q)",
 		name, err, strings.TrimSpace(stderr.String()))
 }

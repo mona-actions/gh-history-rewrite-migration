@@ -16,7 +16,7 @@ filter-repo invocation so commit SHAs are rewritten exactly once.
 
 > **Repo won't even parse?** Callbacks run *inside* filter-repo's parse
 > loop, so they cannot fix history that crashes the parser (e.g. a
-> malformed author ident). For that, use a pre-parse stream filter —
+> malformed author/committer line). For that, use a pre-parse stream filter —
 > see [`docs/pre-rewrite-scripts.md`](pre-rewrite-scripts.md).
 
 ---

@@ -42,6 +42,8 @@ Your script reads the export on stdin and writes the fixed version to stdout. A 
 
 Scripts run with no shell, via their shebang, in a sanitized environment (`PATH`, `HOME`, `LANG`, `TMPDIR`, plus a forced `LC_ALL=C`); the migration PATs are never forwarded. **Only pass scripts you trust.**
 
+> **Windows is not supported.** Scripts are launched via their `#!` shebang and an executable bit, which is a POSIX mechanism; on Windows validation fails with a "not executable" error. Run pre-rewrite migrations from Linux, macOS, or WSL.
+
 ## See also
 
 - [`docs/callback-scripts.md`](callback-scripts.md) — in-loop callbacks for history that parses.

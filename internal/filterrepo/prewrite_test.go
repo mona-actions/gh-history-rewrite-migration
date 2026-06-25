@@ -1,11 +1,11 @@
 package filterrepo
 
 import (
-	"bytes"
 	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -62,6 +62,16 @@ func TestValidatePreRewriteScripts(t *testing.T) {
 		_, err := ValidatePreRewriteScripts([]string{dir})
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "regular file")
+	})
+
+	t.Run("windows is rejected", func(t *testing.T) {
+		_, err := ValidatePreRewriteScripts([]string{good})
+		if runtime.GOOS == "windows" {
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "not supported on Windows")
+		} else {
+			require.NoError(t, err)
+		}
 	})
 }
 
@@ -265,9 +275,9 @@ func TestReportPipelineFailure(t *testing.T) {
 
 	stages := func() []pipelineStage {
 		return []pipelineStage{
-			{name: "git fast-export", err: &bytes.Buffer{}},
-			{name: "pre-rewrite script repair.pl", err: &bytes.Buffer{}},
-			{name: "git filter-repo --stdin", err: &bytes.Buffer{}},
+			{name: "git fast-export", err: &cappedBuffer{}},
+			{name: "pre-rewrite script repair.pl", err: &cappedBuffer{}},
+			{name: "git filter-repo --stdin", err: &cappedBuffer{}},
 		}
 	}
 
@@ -294,5 +304,24 @@ func TestReportPipelineFailure(t *testing.T) {
 		err := reportPipelineFailure(stages(), []error{exit3, exit3, nil})
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "git fast-export")
+	})
+}
+
+func TestCappedBuffer(t *testing.T) {
+	t.Run("under cap retains everything verbatim", func(t *testing.T) {
+		var c cappedBuffer
+		_, _ = c.Write([]byte("hello "))
+		_, _ = c.Write([]byte("world"))
+		assert.Equal(t, "hello world", c.String())
+	})
+
+	t.Run("over cap keeps the tail and marks truncation", func(t *testing.T) {
+		var c cappedBuffer
+		_, _ = c.Write([]byte(strings.Repeat("a", maxStageStderr)))
+		_, _ = c.Write([]byte("FINAL-ERROR"))
+		assert.LessOrEqual(t, len(c.buf), maxStageStderr, "retained bytes must stay bounded")
+		got := c.String()
+		assert.Contains(t, got, "truncated")
+		assert.True(t, strings.HasSuffix(got, "FINAL-ERROR"), "must retain the most recent bytes")
 	})
 }

@@ -194,7 +194,7 @@ Run `gh history-rewrite-migration <command> --help` for the full flag surface.
 
 - [`docs/large-files.md`](docs/large-files.md) — `--strip-large-files` walkthrough, threshold tuning, the Gate 1 preview, recovery.
 - [`docs/callback-scripts.md`](docs/callback-scripts.md) — the eight callback-script suffixes, validation rules, raw-flag passthrough.
-- [`docs/pre-rewrite-scripts.md`](docs/pre-rewrite-scripts.md) — `--pre-rewrite-script` pre-parse stream filters for history that crashes filter-repo's parser (e.g. malformed author idents).
+- [`docs/pre-rewrite-scripts.md`](docs/pre-rewrite-scripts.md) — `--pre-rewrite-script` pre-parse stream filters for history that crashes filter-repo's parser (e.g. malformed author idents). POSIX only (Linux/macOS/WSL).
 - [`docs/manual-verification.md`](docs/manual-verification.md) — gei-import smoke test for validating archive compatibility beyond unit tests.
 - [`examples/scripts/`](examples/scripts/) — runnable callback examples.
 
