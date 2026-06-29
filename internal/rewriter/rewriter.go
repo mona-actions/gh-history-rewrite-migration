@@ -38,6 +38,7 @@ type Input struct {
 	StripLargeFiles   bool
 	FilterRepoScripts []string
 	FilterRepoFlags   []string
+	PreRewriteScripts []string
 	SkipConfirm       bool
 	NonInteractive    bool
 }
@@ -58,6 +59,10 @@ type Config struct {
 	// FilterRepoFlags is a list of raw filter-repo argv tokens to pass
 	// through. They are validated against filterrepo.ValidateUserFlags.
 	FilterRepoFlags []string
+	// PreRewriteScripts are user-supplied executables that filter the raw
+	// `git fast-export` stream before filter-repo parses it; non-empty means
+	// the rewrite uses the stdin pipeline form.
+	PreRewriteScripts []string
 	// SkipConfirm bypasses the Gate-1 confirmation prompt before strip.
 	SkipConfirm bool
 	// NonInteractive turns any would-be prompt into a hard error so
@@ -73,6 +78,7 @@ type Result struct {
 	LargestStripped  int64
 	BytesFreed       int64
 	ScriptsRun       []string
+	PreScriptsRun    []string
 	UserFlagsApplied []string
 	CommitsRemapped  int
 	Warnings         []string
@@ -159,6 +165,7 @@ func (r *Rewriter) Run(ctx context.Context, inputs ...Input) (*Result, error) {
 		LargeFileThreshold: in.LargeFileThresh,
 		FilterRepoScripts:  append([]string(nil), in.FilterRepoScripts...),
 		FilterRepoFlags:    append([]string(nil), in.FilterRepoFlags...),
+		PreRewriteScripts:  append([]string(nil), in.PreRewriteScripts...),
 		SkipConfirm:        in.SkipConfirm,
 		NonInteractive:     in.NonInteractive,
 	}
@@ -209,15 +216,19 @@ func (r *Rewriter) Run(ctx context.Context, inputs ...Input) (*Result, error) {
 		}
 	}
 
-	rewriteRan := pathsFromFile != "" || len(r.cfg.FilterRepoScripts) > 0 || len(r.cfg.FilterRepoFlags) > 0
+	rewriteRan := pathsFromFile != "" || len(r.cfg.FilterRepoScripts) > 0 || len(r.cfg.FilterRepoFlags) > 0 || len(r.cfg.PreRewriteScripts) > 0
 	if rewriteRan {
 		opts := filterrepo.CombinedOpts{
-			StripActive:      r.cfg.StripLargeFiles,
-			PathsFromFile:    pathsFromFile,
-			ScriptPaths:      r.cfg.FilterRepoScripts,
-			PassthroughFlags: r.cfg.FilterRepoFlags,
+			StripActive:       r.cfg.StripLargeFiles,
+			PathsFromFile:     pathsFromFile,
+			ScriptPaths:       r.cfg.FilterRepoScripts,
+			PassthroughFlags:  r.cfg.FilterRepoFlags,
+			PreRewriteScripts: r.cfg.PreRewriteScripts,
 		}
 		if err := r.runner.Run(ctx, bareRepoPath, opts); err != nil {
+			// A failed rewrite can leave the bare repo half-mutated; drop its
+			// completion sentinel so a resume re-extracts from the raw archive.
+			atomicfs.InvalidateDirComplete(extractDir)
 			return nil, fmt.Errorf("filter-repo rewrite: %w", err)
 		}
 		if pathsFromFile != "" {
@@ -225,6 +236,9 @@ func (r *Rewriter) Run(ctx context.Context, inputs ...Input) (*Result, error) {
 		}
 		for _, p := range r.cfg.FilterRepoScripts {
 			result.ScriptsRun = append(result.ScriptsRun, filepath.Base(p))
+		}
+		for _, p := range r.cfg.PreRewriteScripts {
+			result.PreScriptsRun = append(result.PreScriptsRun, filepath.Base(p))
 		}
 		if len(r.cfg.FilterRepoFlags) > 0 {
 			result.UserFlagsApplied = sanitizeUserFlags(r.cfg.FilterRepoFlags)
@@ -297,6 +311,7 @@ func (r *Rewriter) resolveInput(inputs []Input) (Input, error) {
 		StripLargeFiles:   r.cfg.StripLargeFiles,
 		FilterRepoScripts: append([]string(nil), r.cfg.FilterRepoScripts...),
 		FilterRepoFlags:   append([]string(nil), r.cfg.FilterRepoFlags...),
+		PreRewriteScripts: append([]string(nil), r.cfg.PreRewriteScripts...),
 		SkipConfirm:       r.cfg.SkipConfirm,
 		NonInteractive:    r.cfg.NonInteractive,
 	}, nil
@@ -403,6 +418,17 @@ func (r *Rewriter) validateScripts() error {
 			return fmt.Errorf("callback script %s: not a regular file", p)
 		}
 		seen[kind] = p
+	}
+
+	// Validate pre-rewrite scripts and flags up front, so misconfiguration
+	// fails before the Gate-1 prompt and before any history is touched.
+	if len(r.cfg.PreRewriteScripts) > 0 {
+		if _, err := filterrepo.ValidatePreRewriteScripts(r.cfg.PreRewriteScripts); err != nil {
+			return err
+		}
+		if err := filterrepo.ValidatePreRewriteFlags(r.cfg.FilterRepoFlags); err != nil {
+			return err
+		}
 	}
 	return nil
 }

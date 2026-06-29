@@ -166,6 +166,12 @@ func IsDirComplete(dir string) bool {
 	return err == nil
 }
 
+// InvalidateDirComplete removes <dir>/.complete (best-effort) so a later resume
+// won't treat a half-written directory as complete.
+func InvalidateDirComplete(dir string) {
+	_ = os.Remove(filepath.Join(dir, ".complete"))
+}
+
 // IsFileComplete reports whether path exists and has no .partial sibling
 // (a .partial sibling means a previous write was interrupted).
 func IsFileComplete(path string) bool {

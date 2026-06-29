@@ -450,8 +450,9 @@ type CombinedOpts struct {
 	// validated via ValidateUserFlags.
 	PassthroughFlags []string
 
-	// Extension seam: a future --stdin mode (e.g. fast-export | script | …)
-	// can add an io.Reader here without reworking existing callers.
+	// PreRewriteScripts filter the raw fast-export stream before filter-repo
+	// parses it — the only place a parser-crashing object can be repaired.
+	PreRewriteScripts []string
 }
 
 // Run executes one `git filter-repo` combining strip, callback scripts, and
@@ -460,6 +461,11 @@ type CombinedOpts struct {
 func (r *Runner) Run(ctx context.Context, bareRepoPath string, opts CombinedOpts) error {
 	if err := ValidateUserFlags(opts.PassthroughFlags, opts.StripActive); err != nil {
 		return err
+	}
+	if len(opts.PreRewriteScripts) > 0 {
+		if err := ValidatePreRewriteFlags(opts.PassthroughFlags); err != nil {
+			return err
+		}
 	}
 
 	args := []string{"filter-repo", "--force"}
@@ -493,6 +499,10 @@ func (r *Runner) Run(ctx context.Context, bareRepoPath string, opts CombinedOpts
 	}
 
 	args = append(args, opts.PassthroughFlags...)
+
+	if len(opts.PreRewriteScripts) > 0 {
+		return r.runPreRewritePipeline(ctx, bareRepoPath, args, opts.PreRewriteScripts)
+	}
 
 	r.info(fmt.Sprintf("running git %s", redactForLog(args)))
 	var stderr bytes.Buffer

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/mona-actions/gh-history-rewrite-migration/internal/atomicfs"
 	"github.com/mona-actions/gh-history-rewrite-migration/internal/filterrepo"
 	"github.com/mona-actions/gh-history-rewrite-migration/internal/largefiles"
 	"github.com/mona-actions/gh-history-rewrite-migration/internal/workdir"
@@ -529,4 +531,65 @@ func writeTarGz(t *testing.T, srcRoot, outPath string) {
 		return err
 	})
 	require.NoError(t, err)
+}
+
+func writeExecScript(t *testing.T, name string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), name)
+	require.NoError(t, os.WriteFile(p, []byte("#!/bin/sh\nexec cat\n"), 0o755))
+	return p
+}
+
+func TestRun_PreRewriteScriptsOnly(t *testing.T) {
+	wd := newArchiveWorkDir(t, "foo.git")
+	script := writeExecScript(t, "repair.pre-rewrite.pl")
+	runner := &stubRunner{}
+	r := makeRewriter(wd, runner, &stubAnalyzer{}, Config{PreRewriteScripts: []string{script}}, false, false)
+
+	res, err := r.Run(context.Background())
+	require.NoError(t, err)
+	require.NotNil(t, res)
+	require.Len(t, runner.combinedCalls, 1)
+	assert.Equal(t, []string{script}, runner.combinedCalls[0].PreRewriteScripts)
+	assert.Equal(t, []string{"repair.pre-rewrite.pl"}, res.PreScriptsRun)
+}
+
+func TestRun_PreRewriteScriptNotExecutable_Rejected(t *testing.T) {
+	wd := newArchiveWorkDir(t, "foo.git")
+	bad := filepath.Join(t.TempDir(), "bad.pre-rewrite.pl")
+	require.NoError(t, os.WriteFile(bad, []byte("#!/bin/sh\n"), 0o644)) // no +x
+	runner := &stubRunner{}
+	r := makeRewriter(wd, runner, &stubAnalyzer{}, Config{PreRewriteScripts: []string{bad}}, false, false)
+
+	_, err := r.Run(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not executable")
+	assert.Empty(t, runner.combinedCalls, "runner must not be called when validation fails")
+}
+
+func TestRun_PreRewriteWithRefsFlag_Rejected(t *testing.T) {
+	wd := newArchiveWorkDir(t, "foo.git")
+	script := writeExecScript(t, "repair.pre-rewrite.pl")
+	runner := &stubRunner{}
+	r := makeRewriter(wd, runner, &stubAnalyzer{}, Config{
+		PreRewriteScripts: []string{script},
+		FilterRepoFlags:   []string{"--refs", "main"},
+	}, false, false)
+
+	_, err := r.Run(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "--refs")
+	assert.Empty(t, runner.combinedCalls)
+}
+
+func TestRun_RewriteFailureInvalidatesExtraction(t *testing.T) {
+	wd := newArchiveWorkDir(t, "foo.git")
+	script := writeExecScript(t, "repair.pre-rewrite.pl")
+	runner := &stubRunner{combinedErr: errors.New("boom")}
+	r := makeRewriter(wd, runner, &stubAnalyzer{}, Config{PreRewriteScripts: []string{script}}, false, false)
+
+	_, err := r.Run(context.Background())
+	require.Error(t, err)
+	assert.False(t, atomicfs.IsDirComplete(wd.GitExtractedDir()),
+		"a failed in-place rewrite must invalidate the extraction sentinel so resume re-extracts")
 }

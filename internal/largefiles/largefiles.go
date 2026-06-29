@@ -145,9 +145,9 @@ func (r *Report) WriteCleanupFile(dest string) error {
 
 // sizeUnits maps a normalized suffix to its byte multiplier. Suffixes are
 // matched case-insensitively. We accept both decimal (K, M, G) and binary
-// (Ki, Mi, Gi) conventions; for parity with `git filter-repo` and the
-// PayPal doc the bare K/M/G form is decimal-but-treated-as-1024 to match
-// most engineers' mental model — explicitly documented in README.
+// (Ki, Mi, Gi) conventions; for parity with `git filter-repo` the bare
+// K/M/G form is decimal-but-treated-as-1024 to match
+// most engineers' mental model.
 var sizeUnits = []struct {
 	suffix string
 	mult   int64

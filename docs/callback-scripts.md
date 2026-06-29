@@ -14,6 +14,11 @@ filter-repo invocation so commit SHAs are rewritten exactly once.
 > `--blob-callback` / `--filename-callback` still sees blobs that strip
 > will remove — it cannot assume an earlier pass already deleted them.
 
+> **Repo won't even parse?** Callbacks run *inside* filter-repo's parse
+> loop, so they cannot fix history that crashes the parser (e.g. a
+> malformed author/committer line). For that, use a pre-parse stream filter —
+> see [`docs/pre-rewrite-scripts.md`](pre-rewrite-scripts.md).
+
 ---
 
 ## How a script's "kind" is decided

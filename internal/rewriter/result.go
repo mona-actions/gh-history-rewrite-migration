@@ -34,6 +34,10 @@ func (r *Result) Render(printer TablePrinter, warn WarnFn) {
 	if scripts == "" {
 		scripts = "(none)"
 	}
+	preScripts := strings.Join(r.PreScriptsRun, ", ")
+	if preScripts == "" {
+		preScripts = "(none)"
+	}
 	flags := strings.Join(r.UserFlagsApplied, " ")
 	if flags == "" {
 		flags = "(none)"
@@ -46,6 +50,7 @@ func (r *Result) Render(printer TablePrinter, warn WarnFn) {
 			{"paths stripped", fmt.Sprintf("%d", len(r.PathsStripped))},
 			{"largest stripped", output.HumanBytes(r.LargestStripped)},
 			{"bytes freed", output.HumanBytes(r.BytesFreed)},
+			{"pre-rewrite scripts", fmt.Sprintf("%d (%s)", len(r.PreScriptsRun), preScripts)},
 			{"scripts run", fmt.Sprintf("%d (%s)", len(r.ScriptsRun), scripts)},
 			{"flags applied", flags},
 			{"commits remapped", fmt.Sprintf("%d", r.CommitsRemapped)},

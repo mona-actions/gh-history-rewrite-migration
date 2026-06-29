@@ -170,7 +170,7 @@ A completed v2 work directory contains:
 | --- | --- |
 | `migrate` | **Primary.** Runs `export → rewrite → remap → import` end-to-end with both confirmation gates. |
 | `export` | Advanced. Downloads raw git and metadata archives from the source org. Honors `--export-mode two` and `--export-mode combined`. |
-| `rewrite` | Advanced. Runs `git filter-repo` against the extracted bare repo (`--strip-large-files`, `--filter-repo-script`, `--filter-repo-flag`). |
+| `rewrite` | Advanced. Runs `git filter-repo` against the extracted bare repo (`--strip-large-files`, `--filter-repo-script`, `--filter-repo-flag`, `--pre-rewrite-script`). |
 | `import` | Advanced. Pushes a previously rewritten git+metadata archive pair into the target GHEC org via `gh gei migrate-repo`. |
 | `doctor` | Preflight checks (binaries, versions, env vars, source reachability, disk space). |
 
@@ -194,6 +194,7 @@ Run `gh history-rewrite-migration <command> --help` for the full flag surface.
 
 - [`docs/large-files.md`](docs/large-files.md) — `--strip-large-files` walkthrough, threshold tuning, the Gate 1 preview, recovery.
 - [`docs/callback-scripts.md`](docs/callback-scripts.md) — the eight callback-script suffixes, validation rules, raw-flag passthrough.
+- [`docs/pre-rewrite-scripts.md`](docs/pre-rewrite-scripts.md) — `--pre-rewrite-script` pre-parse stream filters for history that crashes filter-repo's parser (e.g. malformed author idents). POSIX only (Linux/macOS/WSL).
 - [`docs/manual-verification.md`](docs/manual-verification.md) — gei-import smoke test for validating archive compatibility beyond unit tests.
 - [`examples/scripts/`](examples/scripts/) — runnable callback examples.
 

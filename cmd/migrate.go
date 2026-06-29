@@ -77,6 +77,7 @@ func init() {
 	migrateCmd.Flags().Bool("strip-large-files", false, "Analyze the repo and strip files exceeding --large-file-threshold")
 	migrateCmd.Flags().StringSlice("filter-repo-script", nil, "Path to a user filter-repo callback script (repeatable)")
 	migrateCmd.Flags().StringSlice("filter-repo-flag", nil, "Raw filter-repo flag/arg to pass through (repeatable)")
+	migrateCmd.Flags().StringSlice("pre-rewrite-script", nil, "Path to an executable that filters the raw git fast-export stream before filter-repo parses it (repeatable; for history that crashes the parser, e.g. malformed author idents)")
 
 	// Phase: import.
 	migrateCmd.Flags().Bool("use-github-storage", false, "Use GitHub's blob storage (required for GHES migrations)")
@@ -142,6 +143,7 @@ func runMigrate(cmd *cobra.Command, _ []string) error {
 	stripLarge, _ := cmd.Flags().GetBool("strip-large-files")
 	scripts, _ := cmd.Flags().GetStringSlice("filter-repo-script")
 	frFlags, _ := cmd.Flags().GetStringSlice("filter-repo-flag")
+	preScripts, _ := cmd.Flags().GetStringSlice("pre-rewrite-script")
 
 	// Import-phase flags.
 	useGHStorage, _ := cmd.Flags().GetBool("use-github-storage")
@@ -219,6 +221,7 @@ func runMigrate(cmd *cobra.Command, _ []string) error {
 		LargeFileThreshold: threshold,
 		FilterRepoScripts:  scripts,
 		FilterRepoFlags:    frFlags,
+		PreRewriteScripts:  preScripts,
 		SkipConfirm:        yes,
 		NonInteractive:     nonInteractive,
 	})

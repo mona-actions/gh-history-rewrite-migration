@@ -3,10 +3,8 @@
 GitHub's Migrations API rejects archives that contain blobs larger than
 its size budget, and even archives that import successfully often carry
 hundreds of megabytes of historical build artifacts that no one will
-ever check out again. `--strip-large-files` is a built-in workflow,
-modeled on the customer-published guide
-[*Removing large files from history*](https://github.com/githubcustomers/paypal-migrations-via-actions/blob/docs/large-files/docs/removing-large-files-from-history.md),
-that automates the analyze → identify → strip flow inside the
+ever check out again. `--strip-large-files` is a built-in workflow that
+automates the analyze → identify → strip flow inside the
 orchestrator.
 
 It is opt-in. By default, `migrate` and `rewrite` do not modify history
