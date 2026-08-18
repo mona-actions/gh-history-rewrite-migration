@@ -30,9 +30,6 @@ type Config struct {
 	TargetOrg string
 	// TargetRepo is the destination repository name.
 	TargetRepo string
-	// SourceHostname identifies the source instance. "" or "github.com"
-	// means GitHub.com; any other value is treated as a GHES hostname.
-	SourceHostname string
 	// TargetAPIURL overrides the target API endpoint (e.g. for GHEC with
 	// data residency). Defaults to https://api.github.com.
 	TargetAPIURL string
@@ -173,6 +170,8 @@ func (i *Importer) Run(ctx context.Context) error {
 	}
 
 	// 4. Build args (PATs are NEVER placed here).
+	// Import always uses the rewritten local archives, so --ghes-api-url must not
+	// be passed here; gh-gei would ignore the archive-path flags and re-export unsanitized source archives (github/gh-gei#1339).
 	args := []string{
 		"gei", "migrate-repo",
 		"--github-source-org", i.cfg.SourceOrg,
@@ -181,10 +180,6 @@ func (i *Importer) Run(ctx context.Context) error {
 		"--target-repo", i.cfg.TargetRepo,
 		"--git-archive-path", i.wd.GitArchive(),
 		"--metadata-archive-path", i.wd.MetadataArchive(),
-	}
-	if i.cfg.SourceHostname != "" && i.cfg.SourceHostname != "github.com" {
-		args = append(args, "--ghes-api-url",
-			fmt.Sprintf("https://%s/api/v3", i.cfg.SourceHostname))
 	}
 	if i.cfg.TargetAPIURL != "" {
 		args = append(args, "--target-api-url", i.cfg.TargetAPIURL)
