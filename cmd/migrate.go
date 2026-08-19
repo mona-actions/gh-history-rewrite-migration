@@ -235,7 +235,6 @@ func runMigrate(cmd *cobra.Command, _ []string) error {
 		SourceRepo:                   viper.GetString("REPO"),
 		TargetOrg:                    viper.GetString("TARGET_ORG"),
 		TargetRepo:                   targetRepo,
-		SourceHostname:               viper.GetString("SOURCE_HOSTNAME"),
 		TargetAPIURL:                 targetAPIURL,
 		TargetRepoVisibility:         repoVisibility,
 		UseGitHubStorage:             useGHStorage,

@@ -30,11 +30,10 @@ import (
 )
 
 const (
-	e2eSourceOrg      = "acme-org"
-	e2eSourceRepo     = "a-repo-with-lfs"
-	e2eTargetOrg      = "target-org"
-	e2eTargetRepo     = "target-repo"
-	e2eSourceHostname = "ghes.example.com"
+	e2eSourceOrg  = "acme-org"
+	e2eSourceRepo = "a-repo-with-lfs"
+	e2eTargetOrg  = "target-org"
+	e2eTargetRepo = "target-repo"
 )
 
 type e2eArchives struct {
@@ -150,12 +149,11 @@ func runOrchestratorE2E(t *testing.T, mode exporter.Mode, archives e2eArchives, 
 	remapper := remap.NewReal(nil)
 	impExec := &recordingImporterExecer{}
 	imp := importer.New(wd, importer.Config{
-		SourceOrg:      e2eSourceOrg,
-		SourceRepo:     e2eSourceRepo,
-		TargetOrg:      e2eTargetOrg,
-		TargetRepo:     e2eTargetRepo,
-		SourceHostname: e2eSourceHostname,
-		Confirm:        true,
+		SourceOrg:  e2eSourceOrg,
+		SourceRepo: e2eSourceRepo,
+		TargetOrg:  e2eTargetOrg,
+		TargetRepo: e2eTargetRepo,
+		Confirm:    true,
 	}, impExec)
 	out := &recordingPrinters{}
 
@@ -383,6 +381,7 @@ func assertImportReceivedArchives(t *testing.T, execer *recordingImporterExecer,
 	assert.True(t, strings.HasSuffix(execer.gotName, "/gh"))
 	assert.True(t, argsContain(execer.gotArgs, "--git-archive-path", wd.GitArchive()))
 	assert.True(t, argsContain(execer.gotArgs, "--metadata-archive-path", wd.MetadataArchive()))
+	assert.NotContains(t, execer.gotArgs, "--ghes-api-url")
 	assert.NotEmpty(t, execer.gitArchive)
 	assert.NotEmpty(t, execer.metadataArchive)
 }

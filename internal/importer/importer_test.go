@@ -101,18 +101,34 @@ func argsContain(args []string, want ...string) bool {
 	return false
 }
 
-func TestRun_HappyPath_GitHubCom(t *testing.T) {
+func argsCount(args []string, want ...string) int {
+	count := 0
+	for i := 0; i+len(want) <= len(args); i++ {
+		match := true
+		for j, w := range want {
+			if args[i+j] != w {
+				match = false
+				break
+			}
+		}
+		if match {
+			count++
+		}
+	}
+	return count
+}
+
+func TestRun_UsesLocalArchivesWithoutGHESAPIURL(t *testing.T) {
 	wd := newWorkDir(t, true)
 	withPATEnv(t, "src-token", "tgt-token")
 
 	stub := &stubExecer{}
 	imp := New(wd, Config{
-		SourceOrg:      "src-org",
-		SourceRepo:     "src-repo",
-		TargetOrg:      "dest-org",
-		TargetRepo:     "dest-repo",
-		SourceHostname: "github.com",
-		Confirm:        true,
+		SourceOrg:  "src-org",
+		SourceRepo: "src-repo",
+		TargetOrg:  "dest-org",
+		TargetRepo: "dest-repo",
+		Confirm:    true,
 	}, stub)
 
 	if err := imp.Run(context.Background()); err != nil {
@@ -138,32 +154,14 @@ func TestRun_HappyPath_GitHubCom(t *testing.T) {
 			t.Errorf("expected args to contain %v, got %v", p, stub.gotArgs)
 		}
 	}
-	for _, a := range stub.gotArgs {
-		if a == "--ghes-api-url" {
-			t.Errorf("did not expect --ghes-api-url for github.com source; args=%v", stub.gotArgs)
-		}
+	if got := argsCount(stub.gotArgs, "--git-archive-path", wd.GitArchive()); got != 1 {
+		t.Errorf("expected exactly one --git-archive-path pair, got %d in args=%v", got, stub.gotArgs)
 	}
-}
-
-func TestRun_GHESSource_AddsAPIURL(t *testing.T) {
-	wd := newWorkDir(t, true)
-	withPATEnv(t, "src-token", "tgt-token")
-
-	stub := &stubExecer{}
-	imp := New(wd, Config{
-		SourceOrg:      "src-org",
-		SourceRepo:     "src-repo",
-		TargetOrg:      "dest-org",
-		TargetRepo:     "dest-repo",
-		SourceHostname: "ghes.example.com",
-		Confirm:        true,
-	}, stub)
-
-	if err := imp.Run(context.Background()); err != nil {
-		t.Fatalf("Run: %v", err)
+	if got := argsCount(stub.gotArgs, "--metadata-archive-path", wd.MetadataArchive()); got != 1 {
+		t.Errorf("expected exactly one --metadata-archive-path pair, got %d in args=%v", got, stub.gotArgs)
 	}
-	if !argsContain(stub.gotArgs, "--ghes-api-url", "https://ghes.example.com/api/v3") {
-		t.Errorf("expected --ghes-api-url https://ghes.example.com/api/v3 in args, got %v", stub.gotArgs)
+	if got := argsCount(stub.gotArgs, "--ghes-api-url"); got != 0 {
+		t.Errorf("expected no --ghes-api-url flag, got %d in args=%v", got, stub.gotArgs)
 	}
 }
 
@@ -241,7 +239,6 @@ func TestRun_CredentialsInEnvNotArgs(t *testing.T) {
 		SourceRepo:                   "src-repo",
 		TargetOrg:                    "o",
 		TargetRepo:                   "r",
-		SourceHostname:               "github.com",
 		AzureStorageConnectionString: "DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=key",
 		Confirm:                      true,
 	}, stub)
