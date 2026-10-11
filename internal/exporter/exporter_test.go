@@ -361,6 +361,22 @@ func TestSplitTreeStandardLayout(t *testing.T) {
 	}
 }
 
+func TestSplitTreeKeepsCompanionWikiWithGitStage(t *testing.T) {
+	extractRoot := t.TempDir()
+	writeFile(t, extractRoot, "schema.json", "schema")
+	writeFile(t, extractRoot, "repositories/Acme/foo.git/HEAD", "ref: refs/heads/main\n")
+	writeFile(t, extractRoot, "repositories/Acme/foo.wiki.git/HEAD", "ref: refs/heads/master\n")
+	writeFile(t, extractRoot, "issues_000001.json", "issues")
+
+	gitStage := filepath.Join(t.TempDir(), "git")
+	metaStage := filepath.Join(t.TempDir(), "meta")
+	require.NoError(t, splitTree(extractRoot, filepath.Join(extractRoot, "repositories/Acme/foo.git"), gitStage, metaStage))
+
+	assert.FileExists(t, filepath.Join(gitStage, "repositories/Acme/foo.git/HEAD"))
+	assert.FileExists(t, filepath.Join(gitStage, "repositories/Acme/foo.wiki.git/HEAD"))
+	assert.NoDirExists(t, filepath.Join(metaStage, "repositories"))
+}
+
 func TestSplitTreeMovesAttachmentLFSAndReleaseSiblingsToMetadata(t *testing.T) {
 	extractRoot := t.TempDir()
 	writeFile(t, extractRoot, "schema.json", "schema")

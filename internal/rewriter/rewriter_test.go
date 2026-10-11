@@ -17,6 +17,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	commitarchive "github.com/mona-actions/gh-commit-remap/pkg/archive"
 	"github.com/mona-actions/gh-history-rewrite-migration/internal/atomicfs"
 	"github.com/mona-actions/gh-history-rewrite-migration/internal/filterrepo"
 	"github.com/mona-actions/gh-history-rewrite-migration/internal/largefiles"
@@ -27,6 +28,7 @@ import (
 // writing one commit-map.
 type stubRunner struct {
 	combinedCalls []filterrepo.CombinedOpts
+	combinedBares []string
 	writeCount    int
 
 	combinedErr error
@@ -34,6 +36,7 @@ type stubRunner struct {
 
 func (s *stubRunner) Run(_ context.Context, bare string, opts filterrepo.CombinedOpts) error {
 	s.combinedCalls = append(s.combinedCalls, opts)
+	s.combinedBares = append(s.combinedBares, bare)
 	if s.combinedErr != nil {
 		return s.combinedErr
 	}
@@ -110,6 +113,30 @@ func TestRun_MultipleBareReposRejected(t *testing.T) {
 	assert.Empty(t, runner.combinedCalls)
 }
 
+func TestRun_CompanionWikiPreservedUnmodified(t *testing.T) {
+	wd := newArchiveWorkDir(t, "foo.git", "foo.wiki.git")
+	rawRoot := extractTarGz(t, wd.RawGitArchive())
+	runner := &stubRunner{}
+	r := makeRewriter(wd, runner, &stubAnalyzer{}, Config{FilterRepoFlags: []string{"--refs", "main"}}, false, false)
+
+	res, err := r.Run(context.Background())
+	require.NoError(t, err)
+	require.NotNil(t, res)
+	require.Len(t, runner.combinedCalls, 1)
+	require.Len(t, runner.combinedBares, 1)
+	assert.Equal(t, filepath.Join(wd.GitExtractedDir(), "repositories", "Acme", "foo.git"), runner.combinedBares[0])
+	assert.NotContains(t, runner.combinedBares[0], "wiki")
+
+	finalRoot := extractTarGz(t, wd.GitArchive())
+	assertDirFilesEqual(t,
+		filepath.Join(rawRoot, "repositories", "Acme", "foo.wiki.git"),
+		filepath.Join(finalRoot, "repositories", "Acme", "foo.wiki.git"),
+	)
+	require.NotEmpty(t, res.Warnings)
+	assert.Contains(t, strings.Join(res.Warnings, "\n"), "companion wiki")
+	assert.Contains(t, strings.Join(res.Warnings, "\n"), "included unmodified")
+}
+
 func TestRun_NoBareRepoRejected(t *testing.T) {
 	wd := newArchiveWorkDir(t)
 	r := makeRewriter(wd, &stubRunner{}, &stubAnalyzer{}, Config{}, false, false)
@@ -117,6 +144,16 @@ func TestRun_NoBareRepoRejected(t *testing.T) {
 	_, err := r.Run(context.Background())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no .git directory found")
+}
+
+func TestRun_WikiOnlyRejected(t *testing.T) {
+	wd := newArchiveWorkDir(t, "foo.wiki.git")
+	r := makeRewriter(wd, &stubRunner{}, &stubAnalyzer{}, Config{}, false, false)
+
+	_, err := r.Run(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "only a wiki repository found")
+	assert.Contains(t, err.Error(), "must include the main repository")
 }
 
 func TestRun_StripHappyPath(t *testing.T) {
@@ -529,6 +566,42 @@ func writeTarGz(t *testing.T, srcRoot, outPath string) {
 		defer f.Close()
 		_, err = io.Copy(tw, f)
 		return err
+	})
+	require.NoError(t, err)
+}
+
+func extractTarGz(t *testing.T, archivePath string) string {
+	t.Helper()
+	dest := t.TempDir()
+	_, err := commitarchive.UnTar(archivePath, dest)
+	require.NoError(t, err)
+	return dest
+}
+
+func assertDirFilesEqual(t *testing.T, wantDir, gotDir string) {
+	t.Helper()
+	require.DirExists(t, gotDir)
+	err := filepath.WalkDir(wantDir, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(wantDir, path)
+		if err != nil {
+			return err
+		}
+		want, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		got, err := os.ReadFile(filepath.Join(gotDir, rel))
+		if err != nil {
+			return err
+		}
+		assert.Equal(t, want, got, rel)
+		return nil
 	})
 	require.NoError(t, err)
 }

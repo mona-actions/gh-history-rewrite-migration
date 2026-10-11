@@ -191,11 +191,11 @@ func (r *Rewriter) Run(ctx context.Context, inputs ...Input) (*Result, error) {
 		}
 	}
 
-	bareRepoPath, err := workdir.FindBareRepo(extractDir)
+	repos, err := workdir.FindBareRepo(extractDir)
 	if err != nil {
 		return nil, wrapFindBareRepoError(extractDir, err)
 	}
-	bareCommitMap := filepath.Join(bareRepoPath, "filter-repo", "commit-map")
+	bareCommitMap := filepath.Join(repos.Main, "filter-repo", "commit-map")
 
 	if len(r.cfg.FilterRepoFlags) > 0 {
 		if err := filterrepo.ValidateUserFlags(r.cfg.FilterRepoFlags, r.cfg.StripLargeFiles); err != nil {
@@ -207,10 +207,15 @@ func (r *Rewriter) Run(ctx context.Context, inputs ...Input) (*Result, error) {
 	}
 
 	result := &Result{}
+	if repos.Wiki != "" {
+		w := fmt.Sprintf("companion wiki %s included unmodified; history rewrite and large-file strip were not applied to it", repos.Wiki)
+		result.Warnings = append(result.Warnings, w)
+		r.warn(w)
+	}
 
 	var pathsFromFile string
 	if r.cfg.StripLargeFiles {
-		pathsFromFile, err = r.prepareStrip(ctx, bareRepoPath, result)
+		pathsFromFile, err = r.prepareStrip(ctx, repos.Main, result)
 		if err != nil {
 			return nil, err
 		}
@@ -225,7 +230,7 @@ func (r *Rewriter) Run(ctx context.Context, inputs ...Input) (*Result, error) {
 			PassthroughFlags:  r.cfg.FilterRepoFlags,
 			PreRewriteScripts: r.cfg.PreRewriteScripts,
 		}
-		if err := r.runner.Run(ctx, bareRepoPath, opts); err != nil {
+		if err := r.runner.Run(ctx, repos.Main, opts); err != nil {
 			// A failed rewrite can leave the bare repo half-mutated; drop its
 			// completion sentinel so a resume re-extracts from the raw archive.
 			atomicfs.InvalidateDirComplete(extractDir)
@@ -249,7 +254,7 @@ func (r *Rewriter) Run(ctx context.Context, inputs ...Input) (*Result, error) {
 		r.warn(w)
 	}
 
-	if w := r.lfsWarning(bareRepoPath); w != "" {
+	if w := r.lfsWarning(repos.Main); w != "" {
 		result.Warnings = append(result.Warnings, w)
 		r.warn(w)
 	}
@@ -339,6 +344,9 @@ func wrapFindBareRepoError(root string, err error) error {
 	switch {
 	case errors.Is(err, workdir.ErrMultipleBareRepos):
 		return fmt.Errorf("multi-repo migrations are not supported: extracted git archive contains multiple .git directories under %s; please migrate one repo at a time: %w", root, err)
+	// Must precede ErrNoBareRepo: ErrWikiOnly wraps it, so errors.Is matches both.
+	case errors.Is(err, workdir.ErrWikiOnly):
+		return fmt.Errorf("only a wiki repository found under %s; the archive must include the main repository: %w", root, err)
 	case errors.Is(err, workdir.ErrNoBareRepo):
 		return fmt.Errorf("no .git directory found under %s; archive may be corrupt or empty: %w", root, err)
 	default:
