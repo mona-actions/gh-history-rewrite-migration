@@ -25,7 +25,7 @@ func TestFindBareRepo(t *testing.T) {
 
 		got, err := FindBareRepo(root)
 		require.NoError(t, err)
-		assert.Equal(t, gitDir, got)
+		assert.Equal(t, gitDir, got.Main)
 	})
 
 	t.Run("real archive depth", func(t *testing.T) {
@@ -35,7 +35,29 @@ func TestFindBareRepo(t *testing.T) {
 
 		got, err := FindBareRepo(root)
 		require.NoError(t, err)
-		assert.Equal(t, gitDir, got)
+		assert.Equal(t, gitDir, got.Main)
+	})
+
+	t.Run("single repo without wiki", func(t *testing.T) {
+		root := t.TempDir()
+		gitDir := filepath.Join(root, "repositories", "Acme", "foo.git")
+		require.NoError(t, os.MkdirAll(gitDir, 0755))
+
+		got, err := FindBareRepo(root)
+		require.NoError(t, err)
+		assert.Equal(t, RepoPaths{Main: gitDir}, got)
+	})
+
+	t.Run("repo with companion wiki", func(t *testing.T) {
+		root := t.TempDir()
+		gitDir := filepath.Join(root, "repositories", "Acme", "foo.git")
+		wikiDir := filepath.Join(root, "repositories", "Acme", "foo.wiki.git")
+		require.NoError(t, os.MkdirAll(gitDir, 0755))
+		require.NoError(t, os.MkdirAll(wikiDir, 0755))
+
+		got, err := FindBareRepo(root)
+		require.NoError(t, err)
+		assert.Equal(t, RepoPaths{Main: gitDir, Wiki: wikiDir}, got)
 	})
 
 	t.Run("multi match", func(t *testing.T) {
@@ -45,6 +67,74 @@ func TestFindBareRepo(t *testing.T) {
 
 		_, err := FindBareRepo(root)
 		assert.ErrorIs(t, err, ErrMultipleBareRepos)
+	})
+
+	t.Run("two repos each with wikis", func(t *testing.T) {
+		root := t.TempDir()
+		paths := []string{
+			filepath.Join(root, "repositories", "Acme", "bar.git"),
+			filepath.Join(root, "repositories", "Acme", "bar.wiki.git"),
+			filepath.Join(root, "repositories", "Acme", "foo.git"),
+			filepath.Join(root, "repositories", "Acme", "foo.wiki.git"),
+		}
+		for _, path := range paths {
+			require.NoError(t, os.MkdirAll(path, 0755))
+		}
+
+		_, err := FindBareRepo(root)
+		require.ErrorIs(t, err, ErrMultipleBareRepos)
+		for _, path := range paths {
+			assert.Contains(t, err.Error(), path)
+		}
+	})
+
+	t.Run("repo plus unrelated wiki repo", func(t *testing.T) {
+		root := t.TempDir()
+		gitDir := filepath.Join(root, "foo.git")
+		wikiDir := filepath.Join(root, "bar.wiki.git")
+		require.NoError(t, os.MkdirAll(gitDir, 0755))
+		require.NoError(t, os.MkdirAll(wikiDir, 0755))
+
+		_, err := FindBareRepo(root)
+		require.ErrorIs(t, err, ErrMultipleBareRepos)
+		assert.Contains(t, err.Error(), gitDir)
+		assert.Contains(t, err.Error(), wikiDir)
+	})
+
+	t.Run("lone wiki repo", func(t *testing.T) {
+		root := t.TempDir()
+		wikiDir := filepath.Join(root, "foo.wiki.git")
+		require.NoError(t, os.MkdirAll(wikiDir, 0755))
+
+		_, err := FindBareRepo(root)
+		require.ErrorIs(t, err, ErrWikiOnly)
+		assert.ErrorIs(t, err, ErrNoBareRepo)
+		assert.Contains(t, err.Error(), wikiDir)
+	})
+
+	t.Run("wiki named repo with companion wiki", func(t *testing.T) {
+		root := t.TempDir()
+		gitDir := filepath.Join(root, "foo.wiki.git")
+		wikiDir := filepath.Join(root, "foo.wiki.wiki.git")
+		require.NoError(t, os.MkdirAll(gitDir, 0755))
+		require.NoError(t, os.MkdirAll(wikiDir, 0755))
+
+		got, err := FindBareRepo(root)
+		require.NoError(t, err)
+		assert.Equal(t, RepoPaths{Main: gitDir, Wiki: wikiDir}, got)
+	})
+
+	t.Run("wiki with different parent is not companion", func(t *testing.T) {
+		root := t.TempDir()
+		gitDir := filepath.Join(root, "a", "foo.git")
+		wikiDir := filepath.Join(root, "b", "foo.wiki.git")
+		require.NoError(t, os.MkdirAll(gitDir, 0755))
+		require.NoError(t, os.MkdirAll(wikiDir, 0755))
+
+		_, err := FindBareRepo(root)
+		require.ErrorIs(t, err, ErrMultipleBareRepos)
+		assert.Contains(t, err.Error(), gitDir)
+		assert.Contains(t, err.Error(), wikiDir)
 	})
 
 	t.Run("beyond depth limit", func(t *testing.T) {
@@ -63,7 +153,7 @@ func TestFindBareRepo(t *testing.T) {
 
 		got, err := FindBareRepo(root)
 		require.NoError(t, err)
-		assert.Equal(t, gitDir, got)
+		assert.Equal(t, gitDir, got.Main)
 	})
 }
 
@@ -137,6 +227,7 @@ func TestFindMetadataDirs(t *testing.T) {
 func TestFindBareRepoSentinelErrors(t *testing.T) {
 	assert.True(t, errors.Is(ErrNoBareRepo, ErrNoBareRepo))
 	assert.True(t, errors.Is(ErrMultipleBareRepos, ErrMultipleBareRepos))
+	assert.True(t, errors.Is(ErrWikiOnly, ErrNoBareRepo))
 }
 
 func writeFile(t *testing.T, path string) {

@@ -208,7 +208,7 @@ func (e *Exporter) runCombinedMode(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	bareRepo, err := workdir.FindBareRepo(extractRoot)
+	repos, err := workdir.FindBareRepo(extractRoot)
 	if err != nil {
 		return err
 	}
@@ -221,7 +221,7 @@ func (e *Exporter) runCombinedMode(ctx context.Context) error {
 	if err := os.RemoveAll(metaStage); err != nil {
 		return err
 	}
-	if err := splitTree(extractRoot, bareRepo, gitStage, metaStage); err != nil {
+	if err := splitTree(extractRoot, repos.Main, gitStage, metaStage); err != nil {
 		return err
 	}
 

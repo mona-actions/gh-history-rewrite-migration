@@ -180,7 +180,8 @@ Run `gh history-rewrite-migration <command> --help` for the full flag surface.
 
 ## Limitations
 
-- **Single-repo only.** Multi-repo migration archives are rejected. Run the orchestrator once per repository.
+- **Single-repo only.** Multi-repo migration archives are rejected, but a companion wiki repo (`<name>.wiki.git`) next to the main repo is allowed. Run the orchestrator once per main repository.
+- **Wiki history is migrated as-is.** Rewrites, large-file stripping, LFS checks, and commit-SHA remapping apply only to the main repo. Secrets or large files in wiki history are migrated unchanged, and commit SHAs referenced in wiki pages are not remapped.
 - **Target is always GHEC (`github.com`).** `gh gei migrate-repo` does not support GHES targets, so this orchestrator does not expose a `--target-hostname` flag. Sources may be GHEC or GHES (set `--source-hostname` for GHES).
 - **Upstream `gh-commit-remap` prefix list is incomplete.** Upstream's known SHA-bearing metadata prefixes do not currently include every file where commit SHAs may appear. This project extends the list in `internal/remap` via `SHABearingPrefixes`.
 - **Upstream `gh-commit-remap` scans top-level metadata files only.** This project works around that by recursively discovering metadata roots with `FindMetadataDirs` before invoking the remapper.

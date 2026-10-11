@@ -407,7 +407,7 @@ func assertBareRepoBytesEqual(t *testing.T, leftArchive, rightArchive string) {
 	require.NoError(t, err)
 	rightBare, err := workdir.FindBareRepo(rightRoot)
 	require.NoError(t, err)
-	assert.Equal(t, regularFileBytes(t, leftBare), regularFileBytes(t, rightBare))
+	assert.Equal(t, regularFileBytes(t, leftBare.Main), regularFileBytes(t, rightBare.Main))
 }
 
 func metadataFileSet(t *testing.T, archivePath string) []string {

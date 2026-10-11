@@ -12,13 +12,24 @@ import (
 
 var ErrNoBareRepo = errors.New("no bare repository found")
 var ErrMultipleBareRepos = errors.New("multiple bare repositories found")
+var ErrWikiOnly = fmt.Errorf("%w: only a wiki repository found", ErrNoBareRepo)
+
+// RepoPaths holds the bare repositories found in an extracted archive.
+type RepoPaths struct {
+	Main string
+	// Wiki is the companion <name>.wiki.git of Main, or "" when there is none.
+	Wiki string
+}
 
 // FindBareRepo walks root recursively (depth <= 4) for *.git directories.
-// It returns the path of the single match. Multi-repo migrations are rejected.
-func FindBareRepo(root string) (string, error) {
+// It returns the single main bare repository and, when present, its companion
+// wiki. A *.wiki.git directory is a companion only when the same parent
+// directory contains the matching *.git repository. Multi-repo migrations are
+// rejected.
+func FindBareRepo(root string) (RepoPaths, error) {
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
-		return "", fmt.Errorf("failed to get absolute root path: %w", err)
+		return RepoPaths{}, fmt.Errorf("failed to get absolute root path: %w", err)
 	}
 
 	var matches []string
@@ -45,17 +56,45 @@ func FindBareRepo(root string) (string, error) {
 		return nil
 	})
 	if err != nil {
-		return "", fmt.Errorf("failed to walk %s: %w", absRoot, err)
+		return RepoPaths{}, fmt.Errorf("failed to walk %s: %w", absRoot, err)
 	}
 
-	switch len(matches) {
-	case 0:
-		return "", ErrNoBareRepo
-	case 1:
-		return matches[0], nil
-	default:
-		return "", fmt.Errorf("%w: %v", ErrMultipleBareRepos, matches)
+	if len(matches) == 0 {
+		return RepoPaths{}, ErrNoBareRepo
 	}
+
+	if len(matches) == 1 && strings.HasSuffix(matches[0], ".wiki.git") {
+		return RepoPaths{}, fmt.Errorf("%w: %v", ErrWikiOnly, matches)
+	}
+
+	found := make(map[string]bool, len(matches))
+	for _, match := range matches {
+		found[match] = true
+	}
+
+	// A wiki is a companion only when its main repository was also found.
+	companions := make(map[string]bool)
+	for _, match := range matches {
+		if wiki := wikiFor(match); found[wiki] {
+			companions[wiki] = true
+		}
+	}
+
+	var mains []string
+	for _, match := range matches {
+		if !companions[match] {
+			mains = append(mains, match)
+		}
+	}
+	if len(mains) > 1 {
+		return RepoPaths{}, fmt.Errorf("%w: %v", ErrMultipleBareRepos, matches)
+	}
+
+	repos := RepoPaths{Main: mains[0]}
+	if wiki := wikiFor(repos.Main); found[wiki] {
+		repos.Wiki = wiki
+	}
+	return repos, nil
 }
 
 // FindMetadataDirs walks root recursively (depth <= 3) for directories containing
@@ -137,6 +176,10 @@ func isMetadataFile(name string, prefixes []string) bool {
 		}
 	}
 	return false
+}
+
+func wikiFor(repo string) string {
+	return strings.TrimSuffix(repo, ".git") + ".wiki.git"
 }
 
 func relativeDepth(root, path string) (int, error) {
