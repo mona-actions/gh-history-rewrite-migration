@@ -28,6 +28,8 @@ gh history-rewrite-migration migrate \
 
 Scripts are chained in order and feed a single `filter-repo --stdin` pass, so strip/callback/flag options still compose into one `commit-map`.
 
+With `--strip-large-files` in size mode, the blob size pre-scan runs before your scripts, so the Gate 1 count reflects the original blobs. filter-repo applies the threshold to the blob data it receives after the scripts. `--analyze` without `--strip-large-files` is report-only and is rejected together with `--pre-rewrite-script`.
+
 ## Writing a script
 
 Don't start from scratch. Copy the runnable [`examples/scripts/repair-malformed-idents.pre-rewrite.pl`](../examples/scripts/repair-malformed-idents.pre-rewrite.pl) and edit its `repair_ident` routine for your case. It already handles the tricky parts of the stream format correctly; it unwraps `<mailto:…>` artifacts, rebuilds a clean `Name <email>`, and leaves any ident it can't confidently fix untouched.

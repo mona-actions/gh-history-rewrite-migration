@@ -113,27 +113,40 @@ when supplied via `--filter-repo-flag`:
 | Flag | Why it is blocked |
 | --- | --- |
 | `--force` | The orchestrator sets this internally on every rewrite. |
-| `--analyze` | Used internally by `--strip-large-files`. |
+| `--analyze` | Reserved by the orchestrator. Use the tool's `--analyze` flag instead. |
 | `--dry-run` | A rewrite that does not rewrite is a silent no-op surprise. |
 | `--debug` | Conflicts with the orchestrator's verbose output. |
 
-### Path-selection family — blocked only with `--strip-large-files`
+### Blob size flag — blocked in size mode
 
-When `--strip-large-files` is active, the following are also rejected:
+When `--strip-large-files` runs in size mode (the default), the
+orchestrator passes `--strip-blobs-bigger-than <bytes>` itself, so
+`--filter-repo-flag --strip-blobs-bigger-than` is rejected. Set the
+size with `--large-file-threshold` instead.
+
+Path-selection flags (`--path`, `--invert-paths`, and the rest of the
+family below) are allowed in size mode.
+
+### Path-selection family — blocked only in path mode
+
+When `--strip-large-files` runs in path mode (`--strip-large-files
+--analyze`), the following are also rejected:
 
 ```text
 --invert-paths   --paths-from-file   --path
 --paths          --path-glob         --path-regex
 ```
 
-The orchestrator generates `--paths-from-file <work-dir>/cleanup.txt
---invert-paths` itself. A user-supplied `--invert-paths` would silently
-flip the meaning of `cleanup.txt` (stripping everything **except** the
-listed paths), and a user-supplied `--path*` family would re-scope the
-strip in ways that are nearly impossible to debug after the fact.
+In path mode, the orchestrator generates `--paths-from-file
+<work-dir>/cleanup.txt --invert-paths` itself. A user-supplied
+`--invert-paths` would silently flip the meaning of `cleanup.txt`
+(stripping everything **except** the listed paths), and a user-supplied
+`--path*` family would re-scope the strip in ways that are nearly
+impossible to debug after the fact.
 
-If you need both a large-file strip **and** custom path filtering:
+If you need both a path-mode strip **and** custom path filtering:
 
+- use size mode (drop `--analyze`), which allows path-selection flags,
 - prefer a callback script (e.g., a `commit-callback` that drops
   unwanted file_changes), or
 - run two separate `rewrite` invocations into separate work-dirs and
