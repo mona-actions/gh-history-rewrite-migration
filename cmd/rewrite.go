@@ -24,8 +24,11 @@ This command runs two phases:
   1. git filter-repo on the bare repository (history rewrite)
   2. SHA remapping in metadata JSONs using the commit-map produced by filter-repo
 
-Supports three optional, composable rewrite operations:
-  - --strip-large-files  : analyze + strip files exceeding the size threshold
+Supports these optional, composable rewrite operations:
+  - --strip-large-files  : strip blobs larger than --large-file-threshold
+  - --analyze            : run filter-repo --analyze; with --strip-large-files,
+                           strip whole flagged paths instead of individual blobs;
+                           alone, print the report without changing history
   - --filter-repo-script : attach user callback scripts (kind via filename suffix)
   - --filter-repo-flag   : pass through arbitrary filter-repo flags
 
@@ -36,7 +39,8 @@ After rewriting, the metadata archive is updated with remapped SHAs so
 }
 
 func init() {
-	rewriteCmd.Flags().Bool("strip-large-files", false, "Analyze the repo and strip files exceeding --large-file-threshold")
+	rewriteCmd.Flags().Bool("strip-large-files", false, "Strip blobs larger than --large-file-threshold from history (add --analyze for path-based stripping)")
+	rewriteCmd.Flags().Bool("analyze", false, "Run git filter-repo --analyze. With --strip-large-files, strip whole paths flagged by the analysis (previous default behavior); alone, print the report without changing history")
 	rewriteCmd.Flags().StringSlice("filter-repo-script", nil, "Path to a user filter-repo callback script (repeatable)")
 	rewriteCmd.Flags().StringSlice("filter-repo-flag", nil, "Raw filter-repo flag/arg to pass through (repeatable)")
 	rewriteCmd.Flags().StringSlice("pre-rewrite-script", nil, "Path to an executable that filters the raw git fast-export stream before filter-repo parses it (repeatable; for history that crashes the parser, e.g. malformed author idents)")
@@ -76,6 +80,7 @@ func runRewrite(cmd *cobra.Command, _ []string) error {
 	}
 
 	stripFlag, _ := cmd.Flags().GetBool("strip-large-files")
+	analyze, _ := cmd.Flags().GetBool("analyze")
 	scripts, _ := cmd.Flags().GetStringSlice("filter-repo-script")
 	flags, _ := cmd.Flags().GetStringSlice("filter-repo-flag")
 	preScripts, _ := cmd.Flags().GetStringSlice("pre-rewrite-script")
@@ -88,6 +93,7 @@ func runRewrite(cmd *cobra.Command, _ []string) error {
 
 	cfg := rewriter.Config{
 		StripLargeFiles:    stripFlag,
+		Analyze:            analyze,
 		LargeFileThreshold: threshold,
 		FilterRepoScripts:  scripts,
 		FilterRepoFlags:    flags,
@@ -103,6 +109,10 @@ func runRewrite(cmd *cobra.Command, _ []string) error {
 	}
 	if res != nil {
 		res.Render(output.Table, output.Warn)
+		// Report-only --analyze runs rewrite nothing, so there is no commit-map to remap.
+		if res.AnalyzeOnly {
+			return nil
+		}
 	}
 
 	// Phase 2: remap metadata SHAs using the commit-map from filter-repo.

@@ -43,7 +43,7 @@ gh history-rewrite-migration doctor
 
 ## Quick start
 
-Migrate `acme/legacy-monorepo` from `GHEC` into `acme-cloud` on GHEC-EMU, stripping any file paths whose blobs exceed 400 MB along the way:
+Migrate `acme/legacy-monorepo` from `GHEC` into `acme-cloud` on GHEC-EMU, stripping any blobs larger than 400 MiB along the way:
 
 ```bash
 export GH_SOURCE_PAT=ghp_xxx_source
@@ -59,7 +59,7 @@ gh history-rewrite-migration migrate \
 
 You will be prompted twice:
 
-1. **Gate 1 — pre-strip.** A table of candidate paths (with `MAX BLOB` and `CUMULATIVE` columns) is printed; confirm to rewrite history. Bypass non-interactively with `--yes`.
+1. **Gate 1 — pre-strip.** A summary of the blobs over the threshold (count, largest, total size) is printed; confirm to rewrite history. With `--analyze` (path mode), a table of flagged paths is printed instead. Bypass non-interactively with `--yes`.
 2. **Gate 2 — pre-import.** A post-rewrite summary is printed; confirm to push the rewritten archive into the target org. Bypass non-interactively with `--confirm`.
 
 For CI / scripted use, pair `--non-interactive` with `--yes` and `--confirm` so the run fails fast instead of blocking on stdin:
@@ -70,6 +70,9 @@ gh history-rewrite-migration migrate \
     --strip-large-files \
     --non-interactive --yes --confirm
 ```
+
+> [!NOTE]
+> Earlier versions of `--strip-large-files` stripped whole paths across history using `git filter-repo --analyze`. It now strips only the blobs larger than `--large-file-threshold`, which is much faster on large repositories. Add `--analyze` to keep the path-based behavior, or use `--analyze` alone for a report without changes. See [`docs/large-files.md`](docs/large-files.md).
 
 ---
 
@@ -107,7 +110,7 @@ The end-to-end flow is:
 │   ├── exporter/          # Orchestrates the export phase via the Migrations REST API
 │   ├── filterrepo/        # Wraps the git filter-repo external tool
 │   ├── importer/          # Wraps gh gei migrate-repo for archive import
-│   ├── largefiles/        # Analyze → flag → cleanup workflow for oversized blobs
+│   ├── largefiles/        # Size scan and path analysis for oversized blobs
 │   ├── migrate/           # End-to-end orchestrator (export → rewrite → remap → import)
 │   ├── output/            # Structured console output helpers (tables, summaries)
 │   ├── remap/             # Rewrites commit SHA references in metadata JSONs
@@ -149,6 +152,8 @@ A completed v2 work directory contains:
 └── .export-mode                 # export mode used to create this work-dir
 ```
 
+Large-file options add these artifacts when they apply: `large-blobs.txt` (size mode), `cleanup.txt` (path mode), and `analysis/` (the `--analyze` report).
+
 `git_extracted/` and `metadata_extracted/` may also contain sentinel files used for resumability. Treat the entire work directory as sensitive migration data.
 
 ---
@@ -157,7 +162,7 @@ A completed v2 work directory contains:
 
 | Gate | When | Skipped by | Forced-error in CI by |
 | --- | --- | --- | --- |
-| **Gate 1** — strip preview | After `git filter-repo --analyze`, before any history rewrite | `--yes` | `--non-interactive` (without `--yes`) |
+| **Gate 1** — strip preview | After the blob size scan (or after `git filter-repo --analyze` in path mode), before any history rewrite | `--yes` | `--non-interactive` (without `--yes`) |
 | **Gate 2** — pre-import | After `rewrite` + `remap`, before `gh gei migrate-repo` | `--confirm` | `--non-interactive` (without `--confirm`) |
 
 `--non-interactive` is a CI convenience: it converts any prompt that would otherwise block on stdin into an immediate error, so a misconfigured pipeline does not hang. Standalone `import` always requires `--confirm` when run without a TTY.
@@ -170,7 +175,7 @@ A completed v2 work directory contains:
 | --- | --- |
 | `migrate` | **Primary.** Runs `export → rewrite → remap → import` end-to-end with both confirmation gates. |
 | `export` | Advanced. Downloads raw git and metadata archives from the source org. Honors `--export-mode two` and `--export-mode combined`. |
-| `rewrite` | Advanced. Runs `git filter-repo` against the extracted bare repo (`--strip-large-files`, `--filter-repo-script`, `--filter-repo-flag`, `--pre-rewrite-script`). |
+| `rewrite` | Advanced. Runs `git filter-repo` against the extracted bare repo (`--strip-large-files`, `--analyze`, `--filter-repo-script`, `--filter-repo-flag`, `--pre-rewrite-script`). |
 | `import` | Advanced. Pushes a previously rewritten git+metadata archive pair into the target GHEC org via `gh gei migrate-repo`. |
 | `doctor` | Preflight checks (binaries, versions, env vars, source reachability, disk space). |
 
@@ -193,7 +198,7 @@ Run `gh history-rewrite-migration <command> --help` for the full flag surface.
 
 ## Documentation
 
-- [`docs/large-files.md`](docs/large-files.md) — `--strip-large-files` walkthrough, threshold tuning, the Gate 1 preview, recovery.
+- [`docs/large-files.md`](docs/large-files.md) — `--strip-large-files` and `--analyze` walkthrough: size mode vs. path mode, threshold tuning, the Gate 1 preview, recovery.
 - [`docs/callback-scripts.md`](docs/callback-scripts.md) — the eight callback-script suffixes, validation rules, raw-flag passthrough.
 - [`docs/pre-rewrite-scripts.md`](docs/pre-rewrite-scripts.md) — `--pre-rewrite-script` pre-parse stream filters for history that crashes filter-repo's parser (e.g. malformed author idents). POSIX only (Linux/macOS/WSL).
 - [`docs/manual-verification.md`](docs/manual-verification.md) — gei-import smoke test for validating archive compatibility beyond unit tests.

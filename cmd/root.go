@@ -36,7 +36,7 @@ func init() {
 	rootCmd.PersistentFlags().String("repo", "", "Source repository name")
 	rootCmd.PersistentFlags().String("target-org", "", "Target organization")
 	rootCmd.PersistentFlags().String("source-hostname", "github.com", "Source GitHub hostname (for GHES support)")
-	rootCmd.PersistentFlags().String("large-file-threshold", "400M", "Threshold for large file detection")
+	rootCmd.PersistentFlags().String("large-file-threshold", "400M", "Blob size threshold for --strip-large-files (e.g. 400M, 1G; K/M/G are 1024-based)")
 	rootCmd.PersistentFlags().Bool("no-color", false, "Disable colored output")
 
 	// Set environment variable prefix: GHHRM (GitHub History Rewrite Migration)

@@ -35,7 +35,10 @@ type Input struct {
 	UserCallbacks   []string
 
 	// Existing user-facing flags preserved from the v1 config.
-	StripLargeFiles   bool
+	StripLargeFiles bool
+	// Analyze selects the path-based filter-repo --analyze flow; without
+	// StripLargeFiles it is report-only.
+	Analyze           bool
 	FilterRepoScripts []string
 	FilterRepoFlags   []string
 	PreRewriteScripts []string
@@ -45,8 +48,12 @@ type Input struct {
 
 // Config holds user-supplied configuration for a rewrite run.
 type Config struct {
-	// StripLargeFiles enables the analyze→cleanup.txt→strip workflow.
+	// StripLargeFiles enables the large-file strip. By default it strips
+	// blobs by size; with Analyze it uses the analyze→cleanup.txt path flow.
 	StripLargeFiles bool
+	// Analyze selects the path-based filter-repo --analyze flow; without
+	// StripLargeFiles it is report-only.
+	Analyze bool
 	// LargeFileThreshold is the resolved byte threshold used by the
 	// Analyzer. The caller is responsible for parsing user-supplied
 	// strings via largefiles.ParseThreshold before constructing the
@@ -73,8 +80,14 @@ type Config struct {
 // Result is the structured outcome of a successful Run, suitable for
 // rendering as a summary table.
 type Result struct {
-	StripPerformed   bool
-	PathsStripped    []string
+	StripPerformed bool
+	// StripMode is StripNone when no strip was requested. It is set whenever
+	// a strip was requested, even if nothing exceeded the threshold.
+	StripMode     filterrepo.StripMode
+	PathsStripped []string
+	// BlobsStripped is an upper bound in size mode: the scan includes
+	// unreachable blobs that filter-repo would drop anyway.
+	BlobsStripped    int
 	LargestStripped  int64
 	BytesFreed       int64
 	ScriptsRun       []string
@@ -82,6 +95,11 @@ type Result struct {
 	UserFlagsApplied []string
 	CommitsRemapped  int
 	Warnings         []string
+
+	// AnalyzeOnly marks a report-only --analyze run: nothing was rewritten and
+	// no git archive or commit-map was written, so callers must not remap or import.
+	AnalyzeOnly   bool
+	AnalyzedPaths int
 }
 
 // runnerIface is the minimal subset of *filterrepo.Runner the rewriter
@@ -95,7 +113,8 @@ type runnerIface interface {
 // analyzerIface is the minimal subset of *largefiles.Analyzer the
 // rewriter uses.
 type analyzerIface interface {
-	Analyze(ctx context.Context, bareRepoPath string) (*largefiles.Report, error)
+	Analyze(ctx context.Context, bareRepoPath, reportDir string) (*largefiles.Report, error)
+	ScanBlobs(ctx context.Context, bareRepoPath string) (*largefiles.BlobReport, error)
 }
 
 // confirmFn matches output.Confirm so tests can stub the Gate-1 prompt.
@@ -153,7 +172,8 @@ func (r *Rewriter) warn(msg string) {
 
 // Run executes the v2 mode-unaware rewrite pipeline. New callers pass an
 // Input explicitly; legacy callers constructed with New may omit it, in which
-// case the constructor WorkDir/Config are used.
+// case the constructor WorkDir/Config are used. A Result with AnalyzeOnly set
+// means no final git archive or commit-map exists; callers must not remap or import.
 func (r *Rewriter) Run(ctx context.Context, inputs ...Input) (*Result, error) {
 	in, err := r.resolveInput(inputs)
 	if err != nil {
@@ -162,6 +182,7 @@ func (r *Rewriter) Run(ctx context.Context, inputs ...Input) (*Result, error) {
 	r.wd = in.WorkDir
 	r.cfg = Config{
 		StripLargeFiles:    in.StripLargeFiles,
+		Analyze:            in.Analyze,
 		LargeFileThreshold: in.LargeFileThresh,
 		FilterRepoScripts:  append([]string(nil), in.FilterRepoScripts...),
 		FilterRepoFlags:    append([]string(nil), in.FilterRepoFlags...),
@@ -170,7 +191,12 @@ func (r *Rewriter) Run(ctx context.Context, inputs ...Input) (*Result, error) {
 		NonInteractive:     in.NonInteractive,
 	}
 
-	rawGit := in.WorkDir.RawGitArchive()
+	if r.cfg.Analyze && !r.cfg.StripLargeFiles {
+		// This runs before the final-archive check because a report changes nothing,
+		// so it is safe to repeat after a finished rewrite.
+		return r.runAnalyzeOnly(ctx)
+	}
+
 	extractDir := in.WorkDir.GitExtractedDir()
 	finalArchive := in.WorkDir.GitArchive()
 
@@ -179,26 +205,15 @@ func (r *Rewriter) Run(ctx context.Context, inputs ...Input) (*Result, error) {
 		return r.cachedResult(), nil
 	}
 
-	if !atomicfs.IsDirComplete(extractDir) {
-		if err := os.RemoveAll(extractDir); err != nil {
-			return nil, fmt.Errorf("prepare git extraction dir: %w", err)
-		}
-		if _, err := archive.UnTar(rawGit, extractDir); err != nil {
-			return nil, fmt.Errorf("extract raw git archive %s: %w", rawGit, err)
-		}
-		if err := atomicfs.MarkDirComplete(extractDir); err != nil {
-			return nil, fmt.Errorf("mark git extraction complete: %w", err)
-		}
-	}
-
-	repos, err := workdir.FindBareRepo(extractDir)
+	repos, err := r.extractRepos()
 	if err != nil {
-		return nil, wrapFindBareRepoError(extractDir, err)
+		return nil, err
 	}
 	bareCommitMap := filepath.Join(repos.Main, "filter-repo", "commit-map")
 
+	mode := r.cfg.stripMode()
 	if len(r.cfg.FilterRepoFlags) > 0 {
-		if err := filterrepo.ValidateUserFlags(r.cfg.FilterRepoFlags, r.cfg.StripLargeFiles); err != nil {
+		if err := filterrepo.ValidateUserFlags(r.cfg.FilterRepoFlags, mode); err != nil {
 			return nil, err
 		}
 	}
@@ -207,28 +222,31 @@ func (r *Rewriter) Run(ctx context.Context, inputs ...Input) (*Result, error) {
 	}
 
 	result := &Result{}
-	if repos.Wiki != "" {
-		w := fmt.Sprintf("companion wiki %s included unmodified; history rewrite and large-file strip were not applied to it", repos.Wiki)
-		result.Warnings = append(result.Warnings, w)
-		r.warn(w)
-	}
+	r.addWikiWarning(repos, result)
 
 	var pathsFromFile string
-	if r.cfg.StripLargeFiles {
+	var stripBiggerThan int64
+	result.StripMode = mode
+	switch mode {
+	case filterrepo.StripByPath:
 		pathsFromFile, err = r.prepareStrip(ctx, repos.Main, result)
-		if err != nil {
-			return nil, err
-		}
+	case filterrepo.StripBySize:
+		stripBiggerThan, err = r.prepareSizeStrip(ctx, repos.Main, result)
+	}
+	if err != nil {
+		return nil, err
 	}
 
-	rewriteRan := pathsFromFile != "" || len(r.cfg.FilterRepoScripts) > 0 || len(r.cfg.FilterRepoFlags) > 0 || len(r.cfg.PreRewriteScripts) > 0
+	stripRequested := pathsFromFile != "" || stripBiggerThan > 0
+	rewriteRan := stripRequested || len(r.cfg.FilterRepoScripts) > 0 || len(r.cfg.FilterRepoFlags) > 0 || len(r.cfg.PreRewriteScripts) > 0
 	if rewriteRan {
 		opts := filterrepo.CombinedOpts{
-			StripActive:       r.cfg.StripLargeFiles,
-			PathsFromFile:     pathsFromFile,
-			ScriptPaths:       r.cfg.FilterRepoScripts,
-			PassthroughFlags:  r.cfg.FilterRepoFlags,
-			PreRewriteScripts: r.cfg.PreRewriteScripts,
+			StripMode:            mode,
+			PathsFromFile:        pathsFromFile,
+			StripBlobsBiggerThan: stripBiggerThan,
+			ScriptPaths:          r.cfg.FilterRepoScripts,
+			PassthroughFlags:     r.cfg.FilterRepoFlags,
+			PreRewriteScripts:    r.cfg.PreRewriteScripts,
 		}
 		if err := r.runner.Run(ctx, repos.Main, opts); err != nil {
 			// A failed rewrite can leave the bare repo half-mutated; drop its
@@ -236,9 +254,7 @@ func (r *Rewriter) Run(ctx context.Context, inputs ...Input) (*Result, error) {
 			atomicfs.InvalidateDirComplete(extractDir)
 			return nil, fmt.Errorf("filter-repo rewrite: %w", err)
 		}
-		if pathsFromFile != "" {
-			result.StripPerformed = true
-		}
+		result.StripPerformed = stripRequested
 		for _, p := range r.cfg.FilterRepoScripts {
 			result.ScriptsRun = append(result.ScriptsRun, filepath.Base(p))
 		}
@@ -286,6 +302,65 @@ func (r *Rewriter) Run(ctx context.Context, inputs ...Input) (*Result, error) {
 	return result, nil
 }
 
+// runAnalyzeOnly runs filter-repo --analyze and reports flagged paths without
+// rewriting, writing the final archive, or handing off a commit-map.
+func (r *Rewriter) runAnalyzeOnly(ctx context.Context) (*Result, error) {
+	if len(r.cfg.FilterRepoScripts) > 0 || len(r.cfg.FilterRepoFlags) > 0 || len(r.cfg.PreRewriteScripts) > 0 {
+		return nil, errors.New("--analyze without --strip-large-files is report-only; remove --filter-repo-script/--filter-repo-flag/--pre-rewrite-script or add --strip-large-files")
+	}
+	repos, err := r.extractRepos()
+	if err != nil {
+		return nil, err
+	}
+	result := &Result{AnalyzeOnly: true}
+	r.addWikiWarning(repos, result)
+
+	report, err := r.analyzer.Analyze(ctx, repos.Main, r.wd.AnalysisDir())
+	if err != nil {
+		return nil, fmt.Errorf("analyze large files: %w", err)
+	}
+	if len(report.Flagged) == 0 {
+		r.info("no files exceed threshold")
+	} else {
+		r.printFlaggedTable(report)
+	}
+	r.info(fmt.Sprintf("analysis report written to %s; no changes made", r.wd.AnalysisDir()))
+	result.AnalyzedPaths = len(report.Flagged)
+	return result, nil
+}
+
+// extractRepos untars the raw git archive (unless a complete extraction is
+// already present) and locates the bare repos inside it.
+func (r *Rewriter) extractRepos() (workdir.RepoPaths, error) {
+	rawGit := r.wd.RawGitArchive()
+	extractDir := r.wd.GitExtractedDir()
+	if !atomicfs.IsDirComplete(extractDir) {
+		if err := os.RemoveAll(extractDir); err != nil {
+			return workdir.RepoPaths{}, fmt.Errorf("prepare git extraction dir: %w", err)
+		}
+		if _, err := archive.UnTar(rawGit, extractDir); err != nil {
+			return workdir.RepoPaths{}, fmt.Errorf("extract raw git archive %s: %w", rawGit, err)
+		}
+		if err := atomicfs.MarkDirComplete(extractDir); err != nil {
+			return workdir.RepoPaths{}, fmt.Errorf("mark git extraction complete: %w", err)
+		}
+	}
+	repos, err := workdir.FindBareRepo(extractDir)
+	if err != nil {
+		return workdir.RepoPaths{}, wrapFindBareRepoError(extractDir, err)
+	}
+	return repos, nil
+}
+
+func (r *Rewriter) addWikiWarning(repos workdir.RepoPaths, result *Result) {
+	if repos.Wiki == "" {
+		return
+	}
+	w := fmt.Sprintf("companion wiki %s included unmodified; history rewrite and large-file strip were not applied to it", repos.Wiki)
+	result.Warnings = append(result.Warnings, w)
+	r.warn(w)
+}
+
 func (r *Rewriter) resolveInput(inputs []Input) (Input, error) {
 	if len(inputs) > 1 {
 		return Input{}, errors.New("rewriter: Run accepts at most one Input")
@@ -314,6 +389,7 @@ func (r *Rewriter) resolveInput(inputs []Input) (Input, error) {
 		WorkDir:           r.wd,
 		LargeFileThresh:   threshold,
 		StripLargeFiles:   r.cfg.StripLargeFiles,
+		Analyze:           r.cfg.Analyze,
 		FilterRepoScripts: append([]string(nil), r.cfg.FilterRepoScripts...),
 		FilterRepoFlags:   append([]string(nil), r.cfg.FilterRepoFlags...),
 		PreRewriteScripts: append([]string(nil), r.cfg.PreRewriteScripts...),
@@ -354,12 +430,24 @@ func wrapFindBareRepoError(root string, err error) error {
 	}
 }
 
+// stripMode maps --strip-large-files [--analyze] to a filterrepo.StripMode.
+func (c Config) stripMode() filterrepo.StripMode {
+	switch {
+	case !c.StripLargeFiles:
+		return filterrepo.StripNone
+	case c.Analyze:
+		return filterrepo.StripByPath
+	default:
+		return filterrepo.StripBySize
+	}
+}
+
 // prepareStrip analyzes large files, writes cleanup.txt, prints the table, and
 // runs Gate-1 confirmation. It does NOT run filter-repo (the strip is folded
 // into Run); StripPerformed is set by the caller after the rewrite succeeds.
 // Returns the cleanup.txt path to feed Run, or "" when nothing is flagged.
 func (r *Rewriter) prepareStrip(ctx context.Context, bareRepoPath string, result *Result) (string, error) {
-	report, err := r.analyzer.Analyze(ctx, bareRepoPath)
+	report, err := r.analyzer.Analyze(ctx, bareRepoPath, r.wd.AnalysisDir())
 	if err != nil {
 		return "", fmt.Errorf("analyze large files: %w", err)
 	}
@@ -372,25 +460,9 @@ func (r *Rewriter) prepareStrip(ctx context.Context, bareRepoPath string, result
 	}
 	r.printFlaggedTable(report)
 
-	// Gate 1.
-	if !r.cfg.SkipConfirm {
-		if r.cfg.NonInteractive {
-			return "", errors.New("--yes required to strip files when --non-interactive is set")
-		}
-		if !r.isTTY() {
-			return "", errors.New("--yes required to strip files when not running on a TTY")
-		}
-		prompt := fmt.Sprintf(
-			"Strip these %d paths from history? This rewrites all commits.",
-			len(report.Flagged),
-		)
-		ok, err := r.confirm(prompt, false)
-		if err != nil {
-			return "", fmt.Errorf("confirmation prompt failed: %w", err)
-		}
-		if !ok {
-			return "", errors.New("rewrite aborted by user")
-		}
+	prompt := fmt.Sprintf("Strip these %d paths from history? This rewrites all commits.", len(report.Flagged))
+	if err := r.gate1(prompt); err != nil {
+		return "", err
 	}
 
 	for _, f := range report.Flagged {
@@ -402,6 +474,85 @@ func (r *Rewriter) prepareStrip(ctx context.Context, bareRepoPath string, result
 		}
 	}
 	return r.wd.CleanupTxt(), nil
+}
+
+// prepareSizeStrip scans blob sizes (cheap, no filter-repo --analyze), writes
+// large-blobs.txt, prints a summary, and runs Gate 1. It returns the byte
+// threshold for --strip-blobs-bigger-than, or 0 when no strip is needed.
+func (r *Rewriter) prepareSizeStrip(ctx context.Context, bareRepoPath string, result *Result) (int64, error) {
+	report, err := r.analyzer.ScanBlobs(ctx, bareRepoPath)
+	if err != nil {
+		return 0, fmt.Errorf("scan blob sizes: %w", err)
+	}
+	threshold := report.Threshold
+	// filter-repo checks blob sizes after pre-rewrite scripts run, so a script
+	// can push a blob over the threshold that the scan never saw.
+	preScripts := len(r.cfg.PreRewriteScripts) > 0
+	if preScripts {
+		w := "blob counts come from the scan before pre-rewrite scripts ran; blobs the scripts pushed over the threshold are stripped but not counted."
+		result.Warnings = append(result.Warnings, w)
+		r.warn(w)
+	}
+	if len(report.Blobs) == 0 {
+		// Delete a list from an earlier run so it doesn't suggest blobs are about to be stripped.
+		if err := os.Remove(r.wd.LargeBlobsTxt()); err != nil && !os.IsNotExist(err) {
+			return 0, fmt.Errorf("remove stale large blob list: %w", err)
+		}
+		if !preScripts {
+			r.info("no blobs exceed threshold; nothing to strip")
+			return 0, nil
+		}
+		prompt := fmt.Sprintf("No blobs exceed %s before pre-rewrite scripts run. Strip any the scripts produce above it? This rewrites all commits.", output.HumanBytes(threshold))
+		if err := r.gate1(prompt); err != nil {
+			return 0, err
+		}
+		return threshold, nil
+	}
+	if err := report.WriteBlobList(r.wd.LargeBlobsTxt()); err != nil {
+		return 0, fmt.Errorf("write large blob list: %w", err)
+	}
+	output.Table([]string{"metric", "value"}, [][]string{
+		{"threshold", output.HumanBytes(threshold)},
+		{"blobs over threshold", fmt.Sprintf("%d of %d", len(report.Blobs), report.TotalBlobs)},
+		{"largest blob", output.HumanBytes(report.Largest)},
+		{"total size", output.HumanBytes(report.Total)},
+	})
+	r.info(fmt.Sprintf("blob list written to %s", r.wd.LargeBlobsTxt()))
+
+	prompt := fmt.Sprintf("Strip up to %d blobs larger than %s from history? This rewrites all commits.", len(report.Blobs), output.HumanBytes(threshold))
+	if preScripts {
+		prompt = fmt.Sprintf("Strip up to %d blobs larger than %s from history, plus any the pre-rewrite scripts produce? This rewrites all commits.", len(report.Blobs), output.HumanBytes(threshold))
+	}
+	if err := r.gate1(prompt); err != nil {
+		return 0, err
+	}
+
+	result.BlobsStripped = len(report.Blobs)
+	result.LargestStripped = report.Largest
+	result.BytesFreed = report.Total
+	return threshold, nil
+}
+
+// gate1 confirms a history-rewriting strip. Without --yes it refuses to run
+// unattended rather than block on a prompt nobody can answer.
+func (r *Rewriter) gate1(prompt string) error {
+	if r.cfg.SkipConfirm {
+		return nil
+	}
+	if r.cfg.NonInteractive {
+		return errors.New("--yes required to strip files when --non-interactive is set")
+	}
+	if !r.isTTY() {
+		return errors.New("--yes required to strip files when not running on a TTY")
+	}
+	ok, err := r.confirm(prompt, false)
+	if err != nil {
+		return fmt.Errorf("confirmation prompt failed: %w", err)
+	}
+	if !ok {
+		return errors.New("rewrite aborted by user")
+	}
+	return nil
 }
 
 // checks flags for scripts and duplicate flags before any rewrite work

@@ -70,6 +70,11 @@ func TestOrchestratorE2E_TwoMode_RealFixture(t *testing.T) {
 	assert.FileExists(t, res.wd.MetadataArchive())
 	assert.FileExists(t, filepath.Join(res.wd.GitExtractedDir(), ".complete"))
 	assert.FileExists(t, filepath.Join(res.wd.MetadataExtractedDir(), ".complete"))
+	// StripLargeFiles without Analyze is size mode: a blob scan, no --analyze.
+	assert.Equal(t, "size", tableValue(res.output.tables, "strip mode"))
+	assert.FileExists(t, res.wd.LargeBlobsTxt(), "a 1-byte threshold should flag blobs in the real fixture")
+	assert.NoFileExists(t, res.wd.CleanupTxt(), "size mode must not write cleanup.txt")
+	assert.NoDirExists(t, res.wd.AnalysisDir(), "size mode must not run filter-repo --analyze")
 	assertNoPartials(t, res.root)
 	assertImportReceivedArchives(t, res.importer, res.wd)
 
@@ -128,6 +133,7 @@ func TestOrchestratorE2E_CombinedMode(t *testing.T) {
 func runOrchestratorE2E(t *testing.T, mode exporter.Mode, archives e2eArchives, rwCfg rewriter.Config) e2ePipelineResult {
 	t.Helper()
 	withPATEnv(t, "source-token", "target-token")
+	allowBareRepos(t)
 
 	root := t.TempDir()
 	wd, err := workdir.New(root)
@@ -483,6 +489,15 @@ func requireFilterRepo(t *testing.T) {
 	if !hasFilterRepo() {
 		t.Skip("git filter-repo is not available on PATH; skipping e2e rewrite integration")
 	}
+}
+
+// allowBareRepos lets plain `git filter-repo` run inside the extracted bare
+// repo on hosts configured with safe.bareRepository=explicit.
+func allowBareRepos(t *testing.T) {
+	t.Helper()
+	t.Setenv("GIT_CONFIG_COUNT", "1")
+	t.Setenv("GIT_CONFIG_KEY_0", "safe.bareRepository")
+	t.Setenv("GIT_CONFIG_VALUE_0", "all")
 }
 
 func hasFilterRepo() bool {

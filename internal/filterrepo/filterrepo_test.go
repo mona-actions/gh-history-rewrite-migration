@@ -14,10 +14,14 @@ import (
 )
 
 // fakeExecer records calls and optionally writes fixture files when the
-// command being run is `git filter-repo --analyze`.
+// command being run is `git filter-repo --analyze`, or streams stdoutData
+// (in stdoutChunk-sized writes when > 0) to stdout.
 type fakeExecer struct {
 	calls        [][]string
-	analyzeFiles map[string]string // filename in <bare>/filter-repo/analysis -> content
+	analyzeFiles map[string]string // filename in --report-dir -> content
+	stdoutData   string
+	stdoutChunk  int
+	stderrData   string
 	runErr       error
 	lookPathErr  error
 }
@@ -31,8 +35,12 @@ func (f *fakeExecer) LookPath(name string) (string, error) {
 
 func (f *fakeExecer) Run(ctx context.Context, dir, name string, args []string, stdout, stderr io.Writer) error {
 	f.calls = append(f.calls, append([]string{name}, args...))
-	if len(args) >= 2 && args[0] == "filter-repo" && args[1] == "--analyze" && f.analyzeFiles != nil {
-		analysisDir := filepath.Join(dir, "filter-repo", "analysis")
+	if len(args) >= 4 && args[0] == "filter-repo" && args[1] == "--analyze" && args[2] == "--report-dir" && f.analyzeFiles != nil {
+		analysisDir := args[3]
+		// Mirror filter-repo: refuse to run if the report dir exists.
+		if _, err := os.Stat(analysisDir); err == nil {
+			return errors.New("report dir already exists")
+		}
 		if err := os.MkdirAll(analysisDir, 0o755); err != nil {
 			return err
 		}
@@ -42,17 +50,43 @@ func (f *fakeExecer) Run(ctx context.Context, dir, name string, args []string, s
 			}
 		}
 	}
+	if f.stdoutData != "" {
+		data := []byte(f.stdoutData)
+		chunk := f.stdoutChunk
+		if chunk <= 0 {
+			chunk = len(data)
+		}
+		for len(data) > 0 {
+			n := chunk
+			if n > len(data) {
+				n = len(data)
+			}
+			if _, err := stdout.Write(data[:n]); err != nil {
+				return err
+			}
+			data = data[n:]
+		}
+	}
+	if f.stderrData != "" {
+		_, _ = io.WriteString(stderr, f.stderrData)
+	}
 	return f.runErr
+}
+
+func TestStripMode_String(t *testing.T) {
+	assert.Equal(t, "", StripNone.String())
+	assert.Equal(t, "size", StripBySize.String())
+	assert.Equal(t, "path", StripByPath.String())
 }
 
 func TestValidateUserFlags_AlwaysBlocked(t *testing.T) {
 	cases := []string{"--force", "--analyze", "--dry-run", "--debug"}
 	for _, flag := range cases {
 		t.Run(flag, func(t *testing.T) {
-			err := ValidateUserFlags([]string{flag}, false)
+			err := ValidateUserFlags([]string{flag}, StripNone)
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), flag)
-			err = ValidateUserFlags([]string{flag}, true)
+			err = ValidateUserFlags([]string{flag}, StripByPath)
 			require.Error(t, err)
 		})
 	}
@@ -62,30 +96,70 @@ func TestValidateUserFlags_PathFamily(t *testing.T) {
 	pathFlags := []string{"--invert-paths", "--paths-from-file", "--path", "--paths", "--path-glob", "--path-regex"}
 	for _, flag := range pathFlags {
 		t.Run(flag+"_strip_active", func(t *testing.T) {
-			err := ValidateUserFlags([]string{flag}, true)
+			err := ValidateUserFlags([]string{flag}, StripByPath)
 			require.Error(t, err, "should reject when stripActive=true")
 			assert.Contains(t, err.Error(), flag)
 		})
 		t.Run(flag+"_strip_inactive", func(t *testing.T) {
-			err := ValidateUserFlags([]string{flag}, false)
+			err := ValidateUserFlags([]string{flag}, StripNone)
 			require.NoError(t, err, "should allow when stripActive=false")
 		})
 	}
 }
 
+func TestValidateUserFlags_PathFamilyAllowedInSizeMode(t *testing.T) {
+	for _, flag := range []string{"--invert-paths", "--paths-from-file", "--path", "--paths", "--path-glob", "--path-regex"} {
+		require.NoError(t, ValidateUserFlags([]string{flag}, StripBySize), flag)
+	}
+}
+
+func TestValidateUserFlags_PathFamilyMessageMentionsAnalyzeFlow(t *testing.T) {
+	err := ValidateUserFlags([]string{"--invert-paths"}, StripByPath)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "--analyze")
+	assert.Contains(t, err.Error(), "cleanup.txt")
+}
+
+func TestValidateUserFlags_StripBlobsBiggerThan(t *testing.T) {
+	forms := map[string][]string{
+		"inline":    {"--strip-blobs-bigger-than=10M"},
+		"two-token": {"--strip-blobs-bigger-than", "10M"},
+	}
+	for name, flags := range forms {
+		t.Run(name+"_size_mode", func(t *testing.T) {
+			err := ValidateUserFlags(flags, StripBySize)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "--strip-blobs-bigger-than")
+			assert.Contains(t, err.Error(), "--large-file-threshold")
+		})
+		t.Run(name+"_path_mode", func(t *testing.T) {
+			require.NoError(t, ValidateUserFlags(flags, StripByPath))
+		})
+		t.Run(name+"_no_strip", func(t *testing.T) {
+			require.NoError(t, ValidateUserFlags(flags, StripNone))
+		})
+	}
+}
+
+func TestValidateUserFlags_AnalyzeMessagePointsToToolFlag(t *testing.T) {
+	err := ValidateUserFlags([]string{"--analyze"}, StripNone)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "tool's --analyze flag")
+}
+
 func TestValidateUserFlags_AcceptsFlagWithEquals(t *testing.T) {
-	err := ValidateUserFlags([]string{"--force=true"}, false)
+	err := ValidateUserFlags([]string{"--force=true"}, StripNone)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "--force")
 }
 
 func TestValidateUserFlags_AllowsArbitraryFlags(t *testing.T) {
-	err := ValidateUserFlags([]string{"--refs", "main", "--partial"}, false)
+	err := ValidateUserFlags([]string{"--refs", "main", "--partial"}, StripNone)
 	require.NoError(t, err)
 }
 
 func TestValidateUserFlags_DuplicateCallback(t *testing.T) {
-	err := ValidateUserFlags([]string{"--commit-callback", "body1", "--commit-callback", "body2"}, false)
+	err := ValidateUserFlags([]string{"--commit-callback", "body1", "--commit-callback", "body2"}, StripNone)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "duplicate")
 }
@@ -93,17 +167,17 @@ func TestValidateUserFlags_DuplicateCallback(t *testing.T) {
 func TestValidateUserFlags_NonFlagTokensIgnored(t *testing.T) {
 	// e.g. callback bodies passed as the value to --commit-callback are
 	// non-flag tokens and must not be misclassified.
-	err := ValidateUserFlags([]string{"--commit-callback", "return commit", "--refs", "main"}, false)
+	err := ValidateUserFlags([]string{"--commit-callback", "return commit", "--refs", "main"}, StripNone)
 	require.NoError(t, err)
 }
 
 func TestValidateUserFlags_FlagLikeCallbackBodyNotMisread(t *testing.T) {
 	// A two-token callback whose body happens to look like a reserved or
 	// path-family flag must be treated as a body, not validated as a flag.
-	require.NoError(t, ValidateUserFlags([]string{"--commit-callback", "--force"}, false))
-	require.NoError(t, ValidateUserFlags([]string{"--commit-callback", "--invert-paths"}, true))
+	require.NoError(t, ValidateUserFlags([]string{"--commit-callback", "--force"}, StripNone))
+	require.NoError(t, ValidateUserFlags([]string{"--commit-callback", "--invert-paths"}, StripByPath))
 	// A flag-like body must not seed a false duplicate against a later kind.
-	require.NoError(t, ValidateUserFlags([]string{"--commit-callback", "--blob-callback", "--email-callback", "x"}, false))
+	require.NoError(t, ValidateUserFlags([]string{"--commit-callback", "--blob-callback", "--email-callback", "x"}, StripNone))
 }
 
 func TestPassthroughCallbackKinds(t *testing.T) {
@@ -161,7 +235,7 @@ func TestRun_AssemblesSingleInvocation(t *testing.T) {
 	exec := &fakeExecer{}
 	r := New(exec, nil)
 	err := r.Run(context.Background(), dir, CombinedOpts{
-		StripActive:      true,
+		StripMode:        StripByPath,
 		PathsFromFile:    "/tmp/cleanup.txt",
 		ScriptPaths:      []string{script},
 		PassthroughFlags: []string{"--refs", "main"},
@@ -181,7 +255,7 @@ func TestRun_StripOnly(t *testing.T) {
 	exec := &fakeExecer{}
 	r := New(exec, nil)
 	err := r.Run(context.Background(), "/tmp/repo.git", CombinedOpts{
-		StripActive:   true,
+		StripMode:     StripByPath,
 		PathsFromFile: "/tmp/cleanup.txt",
 	})
 	require.NoError(t, err)
@@ -189,6 +263,50 @@ func TestRun_StripOnly(t *testing.T) {
 	assert.Equal(t, []string{
 		"git", "filter-repo", "--force", "--invert-paths", "--paths-from-file", "/tmp/cleanup.txt",
 	}, exec.calls[0])
+}
+
+func TestRun_StripBySize(t *testing.T) {
+	exec := &fakeExecer{}
+	rec := &recordingLogger{}
+	r := New(exec, rec)
+	err := r.Run(context.Background(), "/tmp/repo.git", CombinedOpts{
+		StripMode:            StripBySize,
+		StripBlobsBiggerThan: 1610612736, // 1.5 GiB: must be raw bytes, never "1.5G"
+		PassthroughFlags:     []string{"--path", "keep/"},
+	})
+	require.NoError(t, err)
+	require.Len(t, exec.calls, 1)
+	assert.Equal(t, []string{
+		"git", "filter-repo", "--force",
+		"--strip-blobs-bigger-than", "1610612736",
+		"--path", "keep/",
+	}, exec.calls[0])
+	assert.Contains(t, strings.Join(rec.msgs, "\n"), "stripping blobs larger than 1.5 GiB (1610612736 bytes)")
+}
+
+func TestRun_StripBySizeZeroOmitsFlag(t *testing.T) {
+	exec := &fakeExecer{}
+	r := New(exec, nil)
+	err := r.Run(context.Background(), "/tmp", CombinedOpts{
+		StripMode:        StripBySize,
+		PassthroughFlags: []string{"--refs", "main"},
+	})
+	require.NoError(t, err)
+	require.Len(t, exec.calls, 1)
+	assert.NotContains(t, exec.calls[0], "--strip-blobs-bigger-than")
+}
+
+func TestRun_RejectsUserStripBlobsBiggerThanInSizeMode(t *testing.T) {
+	exec := &fakeExecer{}
+	r := New(exec, nil)
+	err := r.Run(context.Background(), "/tmp", CombinedOpts{
+		StripMode:            StripBySize,
+		StripBlobsBiggerThan: 1024,
+		PassthroughFlags:     []string{"--strip-blobs-bigger-than=10M"},
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "--large-file-threshold")
+	assert.Empty(t, exec.calls)
 }
 
 func TestRun_FlagsOnly(t *testing.T) {
@@ -217,7 +335,7 @@ func TestRun_RejectsStripBlockedPathFamily(t *testing.T) {
 	exec := &fakeExecer{}
 	r := New(exec, nil)
 	err := r.Run(context.Background(), "/tmp", CombinedOpts{
-		StripActive:      true,
+		StripMode:        StripByPath,
 		PathsFromFile:    "/tmp/cleanup.txt",
 		PassthroughFlags: []string{"--invert-paths"},
 	})
@@ -343,7 +461,7 @@ func TestAnalyze_ParsesFiles(t *testing.T) {
 	}
 	r := New(exec, nil)
 
-	res, err := r.Analyze(context.Background(), dir)
+	res, err := r.Analyze(context.Background(), dir, filepath.Join(dir, "work", "analysis"))
 	require.NoError(t, err)
 	require.NotNil(t, res)
 
@@ -384,7 +502,7 @@ func TestAnalyze_MissingDeletedFileTolerated(t *testing.T) {
 		},
 	}
 	r := New(exec, nil)
-	res, err := r.Analyze(context.Background(), dir)
+	res, err := r.Analyze(context.Background(), dir, filepath.Join(dir, "work", "analysis"))
 	require.NoError(t, err)
 	assert.NotEmpty(t, res.Paths)
 }
@@ -393,8 +511,46 @@ func TestAnalyze_MissingAllSizesIsError(t *testing.T) {
 	dir := t.TempDir()
 	exec := &fakeExecer{}
 	r := New(exec, nil)
-	_, err := r.Analyze(context.Background(), dir)
+	_, err := r.Analyze(context.Background(), dir, filepath.Join(dir, "work", "analysis"))
 	require.Error(t, err)
+}
+
+func TestAnalyze_UsesReportDirOutsideBareRepo(t *testing.T) {
+	bare := t.TempDir()
+	reportDir := filepath.Join(t.TempDir(), "nested", "analysis")
+	exec := &fakeExecer{analyzeFiles: map[string]string{"path-all-sizes.txt": pathAllSizesFixture}}
+	r := New(exec, nil)
+
+	res, err := r.Analyze(context.Background(), bare, reportDir)
+	require.NoError(t, err)
+	assert.Len(t, res.Paths, 3)
+	require.Len(t, exec.calls, 1)
+	assert.Equal(t, []string{"git", "filter-repo", "--analyze", "--report-dir", reportDir}, exec.calls[0])
+	assert.FileExists(t, filepath.Join(reportDir, "path-all-sizes.txt"))
+	assert.NoDirExists(t, filepath.Join(bare, "filter-repo", "analysis"), "report must not land inside the bare repo")
+}
+
+func TestAnalyze_RemovesStaleReportDir(t *testing.T) {
+	bare := t.TempDir()
+	reportDir := filepath.Join(t.TempDir(), "analysis")
+	require.NoError(t, os.MkdirAll(reportDir, 0o755))
+	stale := filepath.Join(reportDir, "stale.txt")
+	require.NoError(t, os.WriteFile(stale, []byte("old"), 0o644))
+
+	exec := &fakeExecer{analyzeFiles: map[string]string{"path-all-sizes.txt": pathAllSizesFixture}}
+	r := New(exec, nil)
+	_, err := r.Analyze(context.Background(), bare, reportDir)
+	require.NoError(t, err, "a pre-existing report dir must be cleared so filter-repo doesn't refuse to run")
+	assert.NoFileExists(t, stale)
+}
+
+func TestAnalyze_RequiresReportDir(t *testing.T) {
+	exec := &fakeExecer{}
+	r := New(exec, nil)
+	_, err := r.Analyze(context.Background(), t.TempDir(), "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "reportDir")
+	assert.Empty(t, exec.calls)
 }
 
 func TestParseSizesFile_SkipsHeaderLines(t *testing.T) {

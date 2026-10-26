@@ -1,155 +1,119 @@
 # Stripping large files from history (`--strip-large-files`)
 
-GitHub's Migrations API rejects archives that contain blobs larger than
-its size budget, and even archives that import successfully often carry
-hundreds of megabytes of historical build artifacts that no one will
-ever check out again. `--strip-large-files` is a built-in workflow that
-automates the analyze → identify → strip flow inside the
-orchestrator.
+GitHub rejects imports containing any single file larger than **400 MiB**.
+`--strip-large-files` removes oversized blobs from history before import.
+It is opt-in; without it, history is not modified.
 
-It is opt-in. By default, `migrate` and `rewrite` do not modify history
-unless you ask them to.
+> [!IMPORTANT]
+> **Behavior change.** `--strip-large-files` used to run
+> `git filter-repo --analyze` and strip whole paths. It now strips only
+> blobs larger than the threshold. Add `--analyze` for the old behavior.
 
----
+## Modes
 
-## How candidates are selected
-
-When `--strip-large-files` is active, the orchestrator runs
-`git filter-repo --analyze` against the bare repo, then aggregates blobs
-**by path**. A path is flagged when:
-
-```text
-max( max_blob_size_at_path, cumulative_size_at_path ) > threshold
-```
-
-Both dimensions matter:
-
-- **`max_blob_size_at_path`** catches the obvious case — a single giant
-  binary that was committed once.
-- **`cumulative_size_at_path`** catches the more common case — a small
-  artifact (say, `dist/bundle.js` at 9 MB) regenerated 200 times by CI,
-  whose history adds up to nearly 2 GB.
-
-The threshold defaults to **400 MiB**. Tune it with
-`--large-file-threshold`:
-
-```bash
-gh history-rewrite-migration migrate \
-    --org acme --repo legacy --target-org acme-cloud \
-    --strip-large-files \
-    --large-file-threshold 1G
-```
-
-Accepted suffixes: `K`, `M`, `G`, `Ki`, `Mi`, `Gi` (case-insensitive).
-`0`, negative values, missing suffixes, and absurdly large values are
-rejected with a clear error.
-
-If the analysis finds zero paths above the threshold, the orchestrator
-exits cleanly with a "no candidates above threshold" message and skips
-the strip step entirely; it does not crash and it does not prompt.
-
----
-
-## Gate 1: the strip preview
-
-Before any rewrite happens, the orchestrator prints a confirmation
-table:
-
-```text
-PATH                          MAX BLOB    CUMULATIVE     N    FIRST INTRODUCED
-data/backup_1.bak             500.0 MiB     1.5 GiB      3    892d146 (Add database backup)
-dist/bundle.js                  9.8 MiB     1.9 GiB    200    abc1234 (CI artifact)
-vendor/sdk.zip                350.0 MiB   350.0 MiB      1    777aaaa (Vendor SDK 4.2)
-```
-
-| Column | Meaning |
+| Flags | Behavior |
 | --- | --- |
-| `PATH` | The repo-relative path that will be stripped (across all of history). |
-| `MAX BLOB` | Largest single blob ever stored at this path. |
-| `CUMULATIVE` | Sum of all blob sizes ever stored at this path (each historical version counts once). |
-| `N` | How many distinct blob revisions exist at this path. |
-| `FIRST INTRODUCED` | The first commit (short SHA + subject) where this path appeared. |
+| `--strip-large-files` | **Size mode (default).** Removes only blob versions larger than the threshold. |
+| `--strip-large-files --analyze` | **Path mode.** Runs `git filter-repo --analyze` and removes every flagged path from all of history. Slow on very large repos. |
+| `--analyze` | **Report only.** Prints flagged paths; changes nothing. |
 
-On a TTY you get an interactive `[y/N]` prompt. In CI / non-TTY
-contexts:
+Size mode is the default because GitHub's limit is per file, and it skips
+`--analyze`, which can take hours on very large repositories.
 
-- Pass `--yes` to bypass the prompt.
-- Pass `--non-interactive` to fail fast (rather than block on stdin)
-  if `--yes` is missing.
+## Threshold
 
----
+Defaults to **400 MiB**. Set it with `--large-file-threshold` (e.g. `1G`).
 
-## What actually runs
+- Suffixes `K`, `M`, `G` (and `Ki`, `Mi`, `Gi`) are 1024-based; fractions like `1.5G` work.
+- A blob is stripped only if it is **strictly larger** than the threshold.
+- Zero, negative, or unparsable values are rejected.
 
-The orchestrator generates `cleanup.txt` inside `<work-dir>/` —
-one path per line — and persists it for auditability:
+## Size mode
 
-```bash
-$ cat ./work-legacy/cleanup.txt
-data/backup_1.bak
-dist/bundle.js
-vendor/sdk.zip
+1. A fast `git cat-file --batch-all-objects` scan counts blobs over the threshold.
+   If there are none, the strip is skipped.
+2. Oversized blobs are written to `<work-dir>/large-blobs.txt` (`<sha>\t<size>`)
+   and shown in the [Gate 1 preview](#gate-1-preview).
+3. After confirmation, filter-repo runs with `--strip-blobs-bigger-than <bytes>`.
+
+Only oversized versions are removed: if `video.mp4` was committed at 50 MiB and
+later at 600 MiB, only the 600 MiB version goes.
+
+Caveats:
+
+- The count is an **upper bound**; the scan includes unreachable blobs.
+- The preview shows SHAs and sizes, not paths. Use `--analyze` to see paths.
+- With `--pre-rewrite-script`, the scan runs before your scripts; filter-repo
+  applies the threshold to the post-script data. The strip (and Gate 1) runs
+  even if the scan finds nothing, and blobs the scripts enlarge aren't counted.
+
+## Path mode (`--strip-large-files --analyze`)
+
+Runs `git filter-repo --analyze` and flags a path when:
+
+```text
+max(max_blob_size_at_path, cumulative_size_at_path) > threshold
 ```
 
-It then invokes a single `git filter-repo` call:
+The cumulative rule catches small artifacts regenerated many times (e.g. a
+9 MB `dist/bundle.js` committed 200 times). Flagged paths are removed from
+**all** of history, including small versions. Paths are written to
+`<work-dir>/cleanup.txt` and stripped with `--invert-paths --paths-from-file`.
+If nothing is flagged, the strip is skipped without prompting.
+
+## Report only (`--analyze`)
+
+Prints the flagged-path table and writes the full report to
+`<work-dir>/analysis/`. No rewrite, archive, commit-map, or prompt.
+`rewrite` exits after the report; `migrate` exits `0` after export. Continue
+with `--resume`, adding `--analyze` for path mode:
 
 ```bash
-git filter-repo --force \
-    --paths-from-file <work-dir>/cleanup.txt --invert-paths \
-    [--commit-callback ...] [--email-callback ...] \
-    [user --filter-repo-flag passthrough...]
+gh history-rewrite-migration migrate --org acme --repo legacy \
+    --target-org acme-cloud --work-dir ./work-legacy --analyze
+
+gh history-rewrite-migration migrate --org acme --repo legacy \
+    --target-org acme-cloud --work-dir ./work-legacy \
+    --strip-large-files --resume
 ```
 
-When `--strip-large-files` is combined with `--filter-repo-script` or
-`--filter-repo-flag`, **all operations are merged into a single
-filter-repo invocation.** Multiple passes would rewrite SHAs multiple
-times, breaking the commit-map handoff.
+Report-only mode rejects `--filter-repo-script`, `--filter-repo-flag`, and
+`--pre-rewrite-script`.
 
----
+## Gate 1 preview
 
-## Recovery and resume
+Before rewriting, the orchestrator shows what it will strip and asks to confirm.
 
-`<work-dir>/` is the source of truth. The most common recovery flow:
+- **Size mode:** threshold, blob count (upper bound), largest blob, total size.
+- **Path mode:** a table of `path`, `max-blob`, `cumulative`, and `reason`
+  (`single blob`, `cumulative`, or `both`).
 
-```bash
-# Strip refused mid-run? Inspect what was about to happen.
-cat ./work-legacy/cleanup.txt
+In CI, pass `--yes` to skip the prompt, or `--non-interactive` to fail instead
+of waiting on stdin.
 
-# Re-run idempotently.
-gh history-rewrite-migration migrate \
-    --org acme --repo legacy --target-org acme-cloud \
-    --work-dir ./work-legacy \
-    --strip-large-files \
-    --resume
-```
+## Combined with other options
 
-`--resume` is the explicit opt-in to re-use prior artifacts in
-`<work-dir>/`. Without it, the orchestrator refuses to overwrite a
-non-empty work directory. Re-running `rewrite` with **different** flags
-than the first run is also refused — you would otherwise end up with a
-half-rewritten archive matching neither flag set.
+The strip, `--filter-repo-script`, and `--filter-repo-flag` run in **one**
+filter-repo pass so commit SHAs are rewritten once. Conflicting passthrough
+flags are rejected:
 
-If you want a clean slate, delete the work directory.
+- Size mode: `--strip-blobs-bigger-than` (use `--large-file-threshold`).
+- Path mode: `--path`, `--paths`, `--path-glob`, `--path-regex`,
+  `--paths-from-file`, `--invert-paths`.
+- Always: `--analyze` (use the tool's `--analyze` flag).
 
----
+See [`callback-scripts.md`](callback-scripts.md#raw-passthrough---filter-repo-flag).
+
+## Resume
+
+`<work-dir>/` is the source of truth. Re-run with `--resume` to reuse it;
+without it, a non-empty work dir is refused. Re-running with different flags
+is also refused. Delete the work dir for a clean slate.
 
 ## Warnings
 
-> **GPG signatures are stripped.** `git filter-repo` does not preserve
-> commit signatures. If your organization requires signed commits as a
-> compliance gate, plan accordingly — re-signing post-migration is on
-> the consumer.
-
-> **LFS interaction.** `--strip-large-files` requires
-> `--allow-lfs-rewrite` on LFS-enabled archives. LFS pointer files are
-> tiny and will not trip the threshold, but if real binaries leaked
-> into git history (LFS misconfig), they **will** be stripped. LFS
-> objects under `git-lfs/` live outside the bare repo — `filter-repo`
-> cannot touch them, so any payload referenced by a stripped path
-> becomes an orphan that the importer may reject.
-
-> **Forks and consumers will diverge.** Rewriting history changes every
-> commit SHA from the strip point forward. Anyone who pushed work back
-> to the source repo (or maintains a fork) must re-clone after
-> migration; their existing branches will not fast-forward into the
-> rewritten target.
+- **GPG signatures are lost.** filter-repo does not preserve commit signatures.
+- **LFS.** Requires `--allow-lfs-rewrite` on LFS archives. Pointer files are
+  tiny, but real binaries leaked into git history will be stripped, and LFS
+  objects they referenced may be orphaned.
+- **SHAs change.** Forks and existing clones must re-clone after migration.

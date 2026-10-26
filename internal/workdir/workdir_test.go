@@ -56,6 +56,8 @@ func TestWorkDirPaths(t *testing.T) {
 		"_git_stage":                  wd.GitStageDir(),
 		"_meta_stage":                 wd.MetaStageDir(),
 		"cleanup.txt":                 wd.CleanupTxt(),
+		"large-blobs.txt":             wd.LargeBlobsTxt(),
+		"analysis":                    wd.AnalysisDir(),
 	}
 
 	for suffix, path := range paths {
