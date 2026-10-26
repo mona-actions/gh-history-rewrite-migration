@@ -28,7 +28,7 @@ gh history-rewrite-migration migrate \
 
 Scripts are chained in order and feed a single `filter-repo --stdin` pass, so strip/callback/flag options still compose into one `commit-map`.
 
-With `--strip-large-files` in size mode, the blob size pre-scan runs before your scripts, so the Gate 1 count reflects the original blobs. filter-repo applies the threshold to the blob data it receives after the scripts. `--analyze` without `--strip-large-files` is report-only and is rejected together with `--pre-rewrite-script`.
+With `--strip-large-files` in size mode, the blob size pre-scan runs before your scripts, so the Gate 1 count reflects the original blobs. filter-repo applies the threshold to the blob data it receives after the scripts, so the strip and Gate 1 still run when the pre-scan finds nothing over the threshold. `--analyze` without `--strip-large-files` is report-only and is rejected together with `--pre-rewrite-script`.
 
 ## Writing a script
 

@@ -44,7 +44,8 @@ Caveats:
 - The count is an **upper bound**; the scan includes unreachable blobs.
 - The preview shows SHAs and sizes, not paths. Use `--analyze` to see paths.
 - With `--pre-rewrite-script`, the scan runs before your scripts; filter-repo
-  applies the threshold to the post-script data.
+  applies the threshold to the post-script data. The strip (and Gate 1) runs
+  even if the scan finds nothing, and blobs the scripts enlarge aren't counted.
 
 ## Path mode (`--strip-large-files --analyze`)
 

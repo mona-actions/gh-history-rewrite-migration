@@ -112,6 +112,50 @@ func TestRun_SizeMode_ZeroBlobsWithScripts_RunsWithoutStrip(t *testing.T) {
 	assert.False(t, res.StripPerformed)
 }
 
+func TestRun_SizeMode_ZeroBlobsWithPreRewriteScripts_KeepsThreshold(t *testing.T) {
+	wd := newArchiveWorkDir(t, "foo.git")
+	pre := writeExecScript(t, "grow.pre-rewrite.pl")
+	analyzer := &stubAnalyzer{blobs: &largefiles.BlobReport{Threshold: 1024, TotalBlobs: 3}}
+	runner := &stubRunner{}
+	r := makeRewriter(wd, runner, analyzer, Config{StripLargeFiles: true, PreRewriteScripts: []string{pre}}, true, true)
+	var prompt string
+	r.confirm = func(p string, _ bool) (bool, error) { prompt = p; return true, nil }
+
+	res, err := r.Run(context.Background())
+	require.NoError(t, err)
+	require.Len(t, runner.combinedCalls, 1)
+	assert.EqualValues(t, 1024, runner.combinedCalls[0].StripBlobsBiggerThan, "scripts can produce oversized blobs the scan never saw")
+	assert.Contains(t, prompt, "before pre-rewrite scripts run")
+	assert.True(t, res.StripPerformed)
+	assert.Zero(t, res.BlobsStripped)
+	assert.Contains(t, strings.Join(res.Warnings, "\n"), "before pre-rewrite scripts ran")
+}
+
+func TestRun_SizeMode_ZeroBlobsWithPreRewriteScripts_RequiresGate1(t *testing.T) {
+	wd := newArchiveWorkDir(t, "foo.git")
+	pre := writeExecScript(t, "grow.pre-rewrite.pl")
+	analyzer := &stubAnalyzer{blobs: &largefiles.BlobReport{Threshold: 1024}}
+	runner := &stubRunner{}
+	r := makeRewriter(wd, runner, analyzer, Config{StripLargeFiles: true, PreRewriteScripts: []string{pre}}, false, false)
+
+	_, err := r.Run(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not running on a TTY")
+	assert.Empty(t, runner.combinedCalls)
+}
+
+func TestRun_SizeMode_WithPreRewriteScripts_PromptMentionsScripts(t *testing.T) {
+	wd := newArchiveWorkDir(t, "foo.git")
+	pre := writeExecScript(t, "grow.pre-rewrite.pl")
+	r := makeRewriter(wd, &stubRunner{}, &stubAnalyzer{blobs: sizeReport()}, Config{StripLargeFiles: true, PreRewriteScripts: []string{pre}}, true, true)
+	var prompt string
+	r.confirm = func(p string, _ bool) (bool, error) { prompt = p; return true, nil }
+
+	_, err := r.Run(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, "Strip up to 2 blobs larger than 1.0 KiB from history, plus any the pre-rewrite scripts produce? This rewrites all commits.", prompt)
+}
+
 func TestRun_SizeMode_Gate1Errors(t *testing.T) {
 	cases := []struct {
 		name    string

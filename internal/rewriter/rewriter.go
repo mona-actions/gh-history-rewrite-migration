@@ -478,21 +478,36 @@ func (r *Rewriter) prepareStrip(ctx context.Context, bareRepoPath string, result
 
 // prepareSizeStrip scans blob sizes (cheap, no filter-repo --analyze), writes
 // large-blobs.txt, prints a summary, and runs Gate 1. It returns the byte
-// threshold for --strip-blobs-bigger-than, or 0 when no blob exceeds it.
+// threshold for --strip-blobs-bigger-than, or 0 when no strip is needed.
 func (r *Rewriter) prepareSizeStrip(ctx context.Context, bareRepoPath string, result *Result) (int64, error) {
 	report, err := r.analyzer.ScanBlobs(ctx, bareRepoPath)
 	if err != nil {
 		return 0, fmt.Errorf("scan blob sizes: %w", err)
+	}
+	threshold := report.Threshold
+	// filter-repo checks blob sizes after pre-rewrite scripts run, so a script
+	// can push a blob over the threshold that the scan never saw.
+	preScripts := len(r.cfg.PreRewriteScripts) > 0
+	if preScripts {
+		w := "blob counts come from the scan before pre-rewrite scripts ran; blobs the scripts pushed over the threshold are stripped but not counted."
+		result.Warnings = append(result.Warnings, w)
+		r.warn(w)
 	}
 	if len(report.Blobs) == 0 {
 		// Delete a list from an earlier run so it doesn't suggest blobs are about to be stripped.
 		if err := os.Remove(r.wd.LargeBlobsTxt()); err != nil && !os.IsNotExist(err) {
 			return 0, fmt.Errorf("remove stale large blob list: %w", err)
 		}
-		r.info("no blobs exceed threshold; nothing to strip")
-		return 0, nil
+		if !preScripts {
+			r.info("no blobs exceed threshold; nothing to strip")
+			return 0, nil
+		}
+		prompt := fmt.Sprintf("No blobs exceed %s before pre-rewrite scripts run. Strip any the scripts produce above it? This rewrites all commits.", output.HumanBytes(threshold))
+		if err := r.gate1(prompt); err != nil {
+			return 0, err
+		}
+		return threshold, nil
 	}
-	threshold := report.Threshold
 	if err := report.WriteBlobList(r.wd.LargeBlobsTxt()); err != nil {
 		return 0, fmt.Errorf("write large blob list: %w", err)
 	}
@@ -505,6 +520,9 @@ func (r *Rewriter) prepareSizeStrip(ctx context.Context, bareRepoPath string, re
 	r.info(fmt.Sprintf("blob list written to %s", r.wd.LargeBlobsTxt()))
 
 	prompt := fmt.Sprintf("Strip up to %d blobs larger than %s from history? This rewrites all commits.", len(report.Blobs), output.HumanBytes(threshold))
+	if preScripts {
+		prompt = fmt.Sprintf("Strip up to %d blobs larger than %s from history, plus any the pre-rewrite scripts produce? This rewrites all commits.", len(report.Blobs), output.HumanBytes(threshold))
+	}
 	if err := r.gate1(prompt); err != nil {
 		return 0, err
 	}
