@@ -35,8 +35,8 @@ func TestScanBlobSizes_FiltersSortsAndCounts(t *testing.T) {
 	}, exec.calls[0])
 	assert.Contains(t, rec.msgs, "scanning blob sizes (git cat-file --batch-all-objects)")
 
-	// commit/tree/tag ignored even when large; exactly-threshold (100) not
-	// flagged; threshold+1 (101) flagged; Size desc then SHA asc.
+	// Large non-blob objects and the 100-byte blob (equal to the threshold) are
+	// skipped, matching filter-repo's strict ">" check; ties sort by SHA.
 	assert.Equal(t, 5, res.TotalBlobs)
 	assert.Equal(t, []BlobInfo{
 		{SHA: "1234000000000000000000000000000000000000", Size: 5000},

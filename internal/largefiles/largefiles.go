@@ -176,7 +176,7 @@ func (a *Analyzer) ScanBlobs(ctx context.Context, bareRepoPath string) (*BlobRep
 		return nil, err
 	}
 	rep := &BlobReport{Threshold: a.threshold, TotalBlobs: res.TotalBlobs, Blobs: res.Oversized}
-	// ScanBlobSizes returns Oversized sorted by Size desc, so the first is largest.
+	// ScanBlobSizes sorts largest first, so the first blob is the largest.
 	if len(rep.Blobs) > 0 {
 		rep.Largest = rep.Blobs[0].Size
 	}

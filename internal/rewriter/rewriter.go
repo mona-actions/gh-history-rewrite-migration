@@ -192,7 +192,8 @@ func (r *Rewriter) Run(ctx context.Context, inputs ...Input) (*Result, error) {
 	}
 
 	if r.cfg.Analyze && !r.cfg.StripLargeFiles {
-		// Report-only: runs even if a final archive exists, since it changes nothing.
+		// This runs before the final-archive check because a report changes nothing,
+		// so it is safe to repeat after a finished rewrite.
 		return r.runAnalyzeOnly(ctx)
 	}
 
@@ -484,7 +485,7 @@ func (r *Rewriter) prepareSizeStrip(ctx context.Context, bareRepoPath string, re
 		return 0, fmt.Errorf("scan blob sizes: %w", err)
 	}
 	if len(report.Blobs) == 0 {
-		// A list left by an earlier run would misdescribe this one.
+		// Delete a list from an earlier run so it doesn't suggest blobs are about to be stripped.
 		if err := os.Remove(r.wd.LargeBlobsTxt()); err != nil && !os.IsNotExist(err) {
 			return 0, fmt.Errorf("remove stale large blob list: %w", err)
 		}

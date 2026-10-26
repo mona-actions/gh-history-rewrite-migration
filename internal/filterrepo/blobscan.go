@@ -80,18 +80,21 @@ type blobLineParser struct {
 	err       error
 }
 
-func (p *blobLineParser) Write(b []byte) (int, error) {
+// Write consumes one chunk of cat-file stdout. Chunk boundaries are arbitrary,
+// so a line may span two calls; io.Writer requires reporting the full chunk as written.
+func (p *blobLineParser) Write(chunk []byte) (int, error) {
 	if p.err != nil {
 		return 0, p.err
 	}
-	n := len(b)
-	for len(b) > 0 {
-		nl := bytes.IndexByte(b, '\n')
-		if nl < 0 {
-			p.partial = append(p.partial, b...)
+	chunkLen := len(chunk)
+	remaining := chunk
+	for len(remaining) > 0 {
+		newlineIdx := bytes.IndexByte(remaining, '\n')
+		if newlineIdx < 0 {
+			p.partial = append(p.partial, remaining...)
 			break
 		}
-		line := b[:nl]
+		line := remaining[:newlineIdx]
 		if len(p.partial) > 0 {
 			p.partial = append(p.partial, line...)
 			line = p.partial
@@ -101,9 +104,9 @@ func (p *blobLineParser) Write(b []byte) (int, error) {
 			return 0, err
 		}
 		p.partial = p.partial[:0]
-		b = b[nl+1:]
+		remaining = remaining[newlineIdx+1:]
 	}
-	return n, nil
+	return chunkLen, nil
 }
 
 // flush parses any trailing line not terminated by a newline.
