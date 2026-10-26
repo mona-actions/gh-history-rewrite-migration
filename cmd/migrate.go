@@ -74,7 +74,8 @@ func init() {
 	_ = viper.BindPFlag("EXPORT_MODE", migrateCmd.Flags().Lookup("export-mode"))
 
 	// Phase: rewrite.
-	migrateCmd.Flags().Bool("strip-large-files", false, "Analyze the repo and strip files exceeding --large-file-threshold")
+	migrateCmd.Flags().Bool("strip-large-files", false, "Strip blobs larger than --large-file-threshold from history (add --analyze for path-based stripping)")
+	migrateCmd.Flags().Bool("analyze", false, "Run git filter-repo --analyze. With --strip-large-files, strip whole paths flagged by the analysis (previous default behavior); alone, print the report without changing history")
 	migrateCmd.Flags().StringSlice("filter-repo-script", nil, "Path to a user filter-repo callback script (repeatable)")
 	migrateCmd.Flags().StringSlice("filter-repo-flag", nil, "Raw filter-repo flag/arg to pass through (repeatable)")
 	migrateCmd.Flags().StringSlice("pre-rewrite-script", nil, "Path to an executable that filters the raw git fast-export stream before filter-repo parses it (repeatable; for history that crashes the parser, e.g. malformed author idents)")
@@ -141,6 +142,11 @@ func runMigrate(cmd *cobra.Command, _ []string) error {
 	resume, _ := cmd.Flags().GetBool("resume")
 	skipDoctor, _ := cmd.Flags().GetBool("skip-doctor")
 	stripLarge, _ := cmd.Flags().GetBool("strip-large-files")
+	analyze, _ := cmd.Flags().GetBool("analyze")
+	lockRepos, _ := cmd.Flags().GetBool("lock-repositories")
+	if err := validateAnalyzeLock(analyze, stripLarge, lockRepos); err != nil {
+		return err
+	}
 	scripts, _ := cmd.Flags().GetStringSlice("filter-repo-script")
 	frFlags, _ := cmd.Flags().GetStringSlice("filter-repo-flag")
 	preScripts, _ := cmd.Flags().GetStringSlice("pre-rewrite-script")
@@ -194,7 +200,6 @@ func runMigrate(cmd *cobra.Command, _ []string) error {
 	}
 	exclAttachments, _ := cmd.Flags().GetBool("exclude-attachments")
 	exclReleases, _ := cmd.Flags().GetBool("exclude-releases")
-	lockRepos, _ := cmd.Flags().GetBool("lock-repositories")
 	mode, err := exporter.ParseMode(viper.GetString("EXPORT_MODE"))
 	if err != nil {
 		return err
@@ -218,6 +223,7 @@ func runMigrate(cmd *cobra.Command, _ []string) error {
 	analyzer := largefiles.New(frRunner, log, threshold)
 	rw := rewriter.New(wd, frRunner, analyzer, log, rewriter.Config{
 		StripLargeFiles:    stripLarge,
+		Analyze:            analyze,
 		LargeFileThreshold: threshold,
 		FilterRepoScripts:  scripts,
 		FilterRepoFlags:    frFlags,
@@ -277,4 +283,14 @@ func runMigrate(cmd *cobra.Command, _ []string) error {
 	)
 
 	return orch.Run(ctx)
+}
+
+// validateAnalyzeLock rejects a report-only --analyze run that would also
+// lock the source repository, since nothing is imported to unlock it.
+func validateAnalyzeLock(analyze, stripLarge, lockRepos bool) error {
+	if analyze && !stripLarge && lockRepos {
+		return fmt.Errorf("--analyze without --strip-large-files only prints a report and does not import; " +
+			"remove --lock-repositories (it would leave the source repository locked) or add --strip-large-files")
+	}
+	return nil
 }

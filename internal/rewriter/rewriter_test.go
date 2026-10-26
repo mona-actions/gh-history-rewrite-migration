@@ -52,14 +52,25 @@ func (s *stubRunner) writeCommitMap(bare string) error {
 }
 
 type stubAnalyzer struct {
-	report *largefiles.Report
-	err    error
-	called bool
+	report    *largefiles.Report
+	err       error
+	called    bool
+	reportDir string
+
+	blobs      *largefiles.BlobReport
+	scanErr    error
+	scanCalled bool
 }
 
-func (s *stubAnalyzer) Analyze(_ context.Context, _ string) (*largefiles.Report, error) {
+func (s *stubAnalyzer) Analyze(_ context.Context, _, reportDir string) (*largefiles.Report, error) {
 	s.called = true
+	s.reportDir = reportDir
 	return s.report, s.err
+}
+
+func (s *stubAnalyzer) ScanBlobs(_ context.Context, _ string) (*largefiles.BlobReport, error) {
+	s.scanCalled = true
+	return s.blobs, s.scanErr
 }
 
 func makeRewriter(wd *workdir.WorkDir, runner runnerIface, analyzer analyzerIface, cfg Config, isTTY bool, confirmAnswer bool) *Rewriter {
@@ -166,18 +177,21 @@ func TestRun_StripHappyPath(t *testing.T) {
 		},
 	}}
 	runner := &stubRunner{}
-	r := makeRewriter(wd, runner, analyzer, Config{StripLargeFiles: true, SkipConfirm: true}, false, false)
+	r := makeRewriter(wd, runner, analyzer, Config{StripLargeFiles: true, Analyze: true, SkipConfirm: true}, false, false)
 
 	res, err := r.Run(context.Background())
 	require.NoError(t, err)
 	require.NotNil(t, res)
 	assert.True(t, res.StripPerformed)
 	assert.Equal(t, []string{"big1.bin", "big2.bin"}, res.PathsStripped)
+	assert.Equal(t, filterrepo.StripByPath, res.StripMode)
+	assert.False(t, analyzer.scanCalled)
 	assert.EqualValues(t, 5_000_000, res.LargestStripped)
 	assert.EqualValues(t, 7_000_000, res.BytesFreed)
 	require.Len(t, runner.combinedCalls, 1)
 	assert.Equal(t, wd.CleanupTxt(), runner.combinedCalls[0].PathsFromFile)
-	assert.True(t, runner.combinedCalls[0].StripActive)
+	assert.Equal(t, filterrepo.StripByPath, runner.combinedCalls[0].StripMode)
+	assert.Equal(t, wd.AnalysisDir(), analyzer.reportDir, "analysis report must live outside the bare repo")
 
 	body, err := os.ReadFile(wd.CleanupTxt())
 	require.NoError(t, err)
@@ -191,7 +205,7 @@ func TestRun_StripZeroFlagged_NoStripStillArchives(t *testing.T) {
 	wd := newArchiveWorkDir(t, "foo.git")
 	analyzer := &stubAnalyzer{report: &largefiles.Report{Threshold: 1024}}
 	runner := &stubRunner{}
-	r := makeRewriter(wd, runner, analyzer, Config{StripLargeFiles: true, SkipConfirm: true}, false, false)
+	r := makeRewriter(wd, runner, analyzer, Config{StripLargeFiles: true, Analyze: true, SkipConfirm: true}, false, false)
 
 	res, err := r.Run(context.Background())
 	require.NoError(t, err)
@@ -244,7 +258,7 @@ func TestRun_NonTTYWithoutYes_Errors(t *testing.T) {
 		Flagged:   []largefiles.FlaggedPath{{Path: "big.bin", MaxDeletedUnpackedBytes: 9999, CumulativeBytes: 9999, Reason: largefiles.ReasonBoth}},
 	}}
 	runner := &stubRunner{}
-	r := makeRewriter(wd, runner, analyzer, Config{StripLargeFiles: true}, false, false)
+	r := makeRewriter(wd, runner, analyzer, Config{StripLargeFiles: true, Analyze: true}, false, false)
 
 	_, err := r.Run(context.Background())
 	require.Error(t, err)
@@ -259,7 +273,7 @@ func TestRun_NonInteractiveWithoutYes_Errors(t *testing.T) {
 		Flagged:   []largefiles.FlaggedPath{{Path: "big.bin", MaxDeletedUnpackedBytes: 9999, CumulativeBytes: 9999, Reason: largefiles.ReasonBoth}},
 	}}
 	runner := &stubRunner{}
-	r := makeRewriter(wd, runner, analyzer, Config{StripLargeFiles: true, NonInteractive: true}, true, false)
+	r := makeRewriter(wd, runner, analyzer, Config{StripLargeFiles: true, Analyze: true, NonInteractive: true}, true, false)
 
 	_, err := r.Run(context.Background())
 	require.Error(t, err)
@@ -310,6 +324,7 @@ func TestRun_StripScriptsAndFlags_SingleInvocation(t *testing.T) {
 	runner := &stubRunner{}
 	r := makeRewriter(wd, runner, analyzer, Config{
 		StripLargeFiles:   true,
+		Analyze:           true,
 		SkipConfirm:       true,
 		FilterRepoScripts: []string{scriptPath},
 		FilterRepoFlags:   []string{"--refs", "main"},
@@ -324,7 +339,7 @@ func TestRun_StripScriptsAndFlags_SingleInvocation(t *testing.T) {
 	require.Len(t, runner.combinedCalls, 1)
 	assert.Equal(t, 1, runner.writeCount)
 	opts := runner.combinedCalls[0]
-	assert.True(t, opts.StripActive)
+	assert.Equal(t, filterrepo.StripByPath, opts.StripMode)
 	assert.Equal(t, wd.CleanupTxt(), opts.PathsFromFile)
 	assert.Equal(t, []string{scriptPath}, opts.ScriptPaths)
 	assert.Equal(t, []string{"--refs", "main"}, opts.PassthroughFlags)
@@ -341,6 +356,7 @@ func TestRun_StripWithPathSelectionFlag_Rejected(t *testing.T) {
 	runner := &stubRunner{}
 	r := makeRewriter(wd, runner, &stubAnalyzer{}, Config{
 		StripLargeFiles: true,
+		Analyze:         true,
 		SkipConfirm:     true,
 		FilterRepoFlags: []string{"--invert-paths"},
 	}, false, false)
@@ -444,6 +460,7 @@ func TestSanitizeUserFlags_RedactsTwoTokenCallbackBody(t *testing.T) {
 func TestResultRender_PrintsKeyFields(t *testing.T) {
 	res := &Result{
 		StripPerformed:   true,
+		StripMode:        filterrepo.StripByPath,
 		PathsStripped:    []string{"big1.bin", "big2.bin"},
 		LargestStripped:  5_000_000,
 		BytesFreed:       7_000_000,
@@ -470,8 +487,11 @@ func TestResultRender_PrintsKeyFields(t *testing.T) {
 	out := buf.String()
 	assert.Contains(t, out, "big1.bin")
 	assert.Contains(t, out, "big2.bin")
+	assert.Contains(t, out, "strip mode|path")
+	assert.Contains(t, out, "paths stripped|2")
+	assert.NotContains(t, out, "blobs stripped")
 	assert.Contains(t, out, "4.8 MiB")
-	assert.Contains(t, out, "6.7 MiB")
+	assert.Contains(t, out, "bytes freed|6.7 MiB")
 	assert.Contains(t, out, "42")
 	assert.Contains(t, out, "a.commit-callback.py")
 	assert.Contains(t, out, "--refs")

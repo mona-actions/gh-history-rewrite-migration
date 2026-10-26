@@ -222,6 +222,78 @@ func TestRun_PreRewritePassthroughPreservesHistory(t *testing.T) {
 	assert.FileExists(t, filepath.Join(repo, "filter-repo", "commit-map"))
 }
 
+// bareRepoWithBigBlob builds a bare repo holding a 4 KiB big.bin and a tiny
+// small.txt, for exercising --strip-blobs-bigger-than end to end.
+func bareRepoWithBigBlob(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "repo")
+	require.NoError(t, os.MkdirAll(repo, 0o755))
+	git(t, repo, "init", "-q")
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "small.txt"), []byte("hi\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "big.bin"), []byte(strings.Repeat("x", 4096)), 0o644))
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-qm", "init")
+	bare := filepath.Join(dir, "bare.git")
+	git(t, dir, "clone", "-q", "--bare", repo, bare)
+	return bare
+}
+
+func TestRun_PreRewriteForwardsStripBlobsBiggerThan(t *testing.T) {
+	requireGitFilterRepo(t)
+	repo := bareRepoWithBigBlob(t)
+	require.Contains(t, git(t, repo, "ls-tree", "-r", "--name-only", "HEAD"), "big.bin")
+
+	dir := t.TempDir()
+	cat := writeScript(t, dir, "cat.sh", "#!/bin/sh\nexec cat\n", 0o755)
+
+	r := New(DefaultExecer{}, nil).WithStdout(os.Stderr)
+	err := r.Run(context.Background(), repo, CombinedOpts{
+		StripMode:            StripBySize,
+		StripBlobsBiggerThan: 1024,
+		PreRewriteScripts:    []string{cat},
+	})
+	require.NoError(t, err)
+
+	files := git(t, repo, "ls-tree", "-r", "--name-only", "HEAD")
+	assert.NotContains(t, files, "big.bin", "--strip-blobs-bigger-than must reach filter-repo --stdin")
+	assert.Contains(t, files, "small.txt")
+}
+
+func TestScanBlobSizes_RealGit(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	repo := bareRepoWithBigBlob(t)
+
+	res, err := New(DefaultExecer{}, nil).ScanBlobSizes(context.Background(), repo, 1024)
+	require.NoError(t, err)
+	assert.Equal(t, 2, res.TotalBlobs)
+	require.Len(t, res.Oversized, 1)
+	assert.EqualValues(t, 4096, res.Oversized[0].Size)
+	assert.Equal(t, git(t, repo, "rev-parse", "HEAD:big.bin"), res.Oversized[0].SHA)
+}
+
+func TestAnalyze_RealFilterRepoReportDir(t *testing.T) {
+	requireGitFilterRepo(t)
+	repo := bareRepoWithBigBlob(t)
+	reportDir := filepath.Join(t.TempDir(), "work", "analysis")
+	// Analyze doesn't pass safe.bareRepository=all itself; allow bare repos
+	// on hosts configured with safe.bareRepository=explicit.
+	t.Setenv("GIT_CONFIG_COUNT", "1")
+	t.Setenv("GIT_CONFIG_KEY_0", "safe.bareRepository")
+	t.Setenv("GIT_CONFIG_VALUE_0", "all")
+
+	r := New(DefaultExecer{}, nil)
+	for i := 0; i < 2; i++ { // second run proves a stale report dir is cleared
+		res, err := r.Analyze(context.Background(), repo, reportDir)
+		require.NoError(t, err, "run %d", i)
+		require.NotEmpty(t, res.Paths)
+		assert.Equal(t, "big.bin", res.Paths[0].Path)
+	}
+	assert.NoDirExists(t, filepath.Join(repo, "filter-repo", "analysis"))
+}
+
 func TestRun_PreRewriteScriptExitCodePropagates(t *testing.T) {
 	requireGitFilterRepo(t)
 	repo := cleanBareRepo(t)

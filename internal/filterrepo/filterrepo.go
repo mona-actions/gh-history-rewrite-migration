@@ -7,10 +7,10 @@
 // The wrapper enforces three guarantees:
 //
 //   - Reserved orchestrator-managed flags (--force, --analyze, --dry-run,
-//     --debug) and, when the large-file strip workflow is active, the
+//     --debug) are always rejected. Depending on the StripMode, the
 //     path-selection family (--invert-paths, --paths-from-file, --path,
-//     --paths, --path-glob, --path-regex) are rejected up-front rather than
-//     silently surprising users.
+//     --paths, --path-glob, --path-regex) or --strip-blobs-bigger-than is
+//     also rejected up-front rather than silently surprising users.
 //   - Callback scripts are dispatched by filename suffix; unknown suffixes
 //     are hard errors and duplicate kinds are rejected.
 //   - Script bodies and tokens are never logged. Only paths and command
@@ -99,14 +99,38 @@ func (r *Runner) info(msg string) {
 // reservedFlags are always rejected — the orchestrator manages them itself.
 var reservedFlags = map[string]string{
 	"--force":   "the orchestrator sets --force internally; do not pass it via --filter-repo-flag",
-	"--analyze": "--analyze is invoked internally by the large-file workflow",
+	"--analyze": "use the tool's --analyze flag instead of passing it through --filter-repo-flag",
 	"--dry-run": "--dry-run is rejected because rewrite must actually rewrite history",
 	"--debug":   "--debug conflicts with the orchestrator's verbose output",
 }
 
-// stripBlockedFlags are only rejected when --strip-large-files is active,
-// because the orchestrator generates --invert-paths --paths-from-file
-// itself; letting the user toggle them flips the meaning of cleanup.txt.
+// StripMode selects how --strip-large-files removes data.
+type StripMode int
+
+const (
+	// StripNone means no large-file strip was requested.
+	StripNone StripMode = iota
+	// StripBySize strips blobs via --strip-blobs-bigger-than.
+	StripBySize
+	// StripByPath strips paths via --invert-paths --paths-from-file (analyze flow).
+	StripByPath
+)
+
+// String returns the user-facing mode name; StripNone renders as "".
+func (m StripMode) String() string {
+	switch m {
+	case StripBySize:
+		return "size"
+	case StripByPath:
+		return "path"
+	default:
+		return ""
+	}
+}
+
+// stripBlockedFlags are only rejected in StripByPath mode, because the
+// orchestrator generates --invert-paths --paths-from-file itself; letting
+// the user toggle them flips the meaning of cleanup.txt.
 var stripBlockedFlags = map[string]struct{}{
 	"--invert-paths":    {},
 	"--paths-from-file": {},
@@ -173,21 +197,35 @@ func (r *Runner) Version(ctx context.Context) (string, error) {
 	return strings.TrimSpace(stdout.String()), nil
 }
 
-// Analyze runs `git filter-repo --analyze` from inside bareRepoPath and
-// parses the resulting per-path size files. It returns aggregated stats
-// suitable for threshold-based flagging.
-func (r *Runner) Analyze(ctx context.Context, bareRepoPath string) (*AnalyzeResult, error) {
+// Analyze runs `git filter-repo --analyze --report-dir <reportDir>` from
+// inside bareRepoPath and parses the resulting per-path size files. It
+// returns aggregated stats suitable for threshold-based flagging.
+//
+// reportDir is removed before the run (filter-repo refuses to overwrite an
+// existing report dir) and should live outside the bare repo so the report
+// is never re-archived with it.
+func (r *Runner) Analyze(ctx context.Context, bareRepoPath, reportDir string) (*AnalyzeResult, error) {
 	if bareRepoPath == "" {
 		return nil, errors.New("bareRepoPath is required")
 	}
+	if reportDir == "" {
+		return nil, errors.New("reportDir is required")
+	}
+	if err := os.RemoveAll(reportDir); err != nil {
+		return nil, fmt.Errorf("remove stale analysis report dir %s: %w", reportDir, err)
+	}
+	if err := os.MkdirAll(filepath.Dir(reportDir), 0o755); err != nil {
+		return nil, fmt.Errorf("create parent of analysis report dir %s: %w", reportDir, err)
+	}
 	r.info("running git filter-repo --analyze")
 	var stdout, stderr bytes.Buffer
-	if err := r.execer.Run(ctx, bareRepoPath, r.bin, []string{"filter-repo", "--analyze"}, &stdout, &stderr); err != nil {
+	args := []string{"filter-repo", "--analyze", "--report-dir", reportDir}
+	if err := r.execer.Run(ctx, bareRepoPath, r.bin, args, &stdout, &stderr); err != nil {
 		return nil, fmt.Errorf("git filter-repo --analyze failed: %w (stderr=%q)", err, stderr.String())
 	}
 
-	allSizes := filepath.Join(bareRepoPath, "filter-repo", "analysis", "path-all-sizes.txt")
-	deletedSizes := filepath.Join(bareRepoPath, "filter-repo", "analysis", "path-deleted-sizes.txt")
+	allSizes := filepath.Join(reportDir, "path-all-sizes.txt")
+	deletedSizes := filepath.Join(reportDir, "path-deleted-sizes.txt")
 
 	// path-all-sizes.txt → cumulative size per path (unpacked column).
 	cumulative, err := parseSizesFile(allSizes, false)
@@ -328,17 +366,22 @@ func extractPathColumn(line string) string {
 	return line[idx:]
 }
 
-// ValidateUserFlags rejects flags the orchestrator reserves. When
-// stripActive is true, it additionally rejects the path-selection family
-// (because --invert-paths flips the meaning of orchestrator-generated
-// cleanup.txt).
+// sizeBlockedFlag is rejected in StripBySize mode because the orchestrator
+// derives --strip-blobs-bigger-than from --large-file-threshold.
+const sizeBlockedFlag = "--strip-blobs-bigger-than"
+
+// ValidateUserFlags rejects flags the orchestrator reserves. In StripByPath
+// mode it additionally rejects the path-selection family (because
+// --invert-paths flips the meaning of orchestrator-generated cleanup.txt).
+// In StripBySize mode it rejects --strip-blobs-bigger-than, which the
+// orchestrator sets from --large-file-threshold.
 //
 // Duplicate *-callback flags of the same kind are rejected.
 //
 // Each entry in flags is an individual argv token, e.g.
 //
 //	["--commit-callback=path/to/cb.py", "--refs", "main"]
-func ValidateUserFlags(flags []string, stripActive bool) error {
+func ValidateUserFlags(flags []string, mode StripMode) error {
 	callbackSeen := map[string]struct{}{}
 	skipNext := false
 	for _, raw := range flags {
@@ -353,9 +396,14 @@ func ValidateUserFlags(flags []string, stripActive bool) error {
 		if reason, blocked := reservedFlags[name]; blocked {
 			return fmt.Errorf("flag %s is reserved: %s", name, reason)
 		}
-		if stripActive {
+		switch mode {
+		case StripByPath:
 			if _, blocked := stripBlockedFlags[name]; blocked {
-				return fmt.Errorf("flag %s is not allowed when --strip-large-files is active: it would conflict with the orchestrator-generated cleanup.txt; either drop --strip-large-files or remove %s", name, name)
+				return fmt.Errorf("flag %s is not allowed with --strip-large-files --analyze: it would conflict with the cleanup.txt generated by the analyze flow; either drop --strip-large-files or remove %s", name, name)
+			}
+		case StripBySize:
+			if name == sizeBlockedFlag {
+				return fmt.Errorf("flag %s is not allowed when --strip-large-files is active: the orchestrator sets it from --large-file-threshold; use --large-file-threshold instead", name)
 			}
 		}
 		if strings.HasSuffix(name, "-callback") {
@@ -437,12 +485,16 @@ func redactForLog(args []string) string {
 // CombinedOpts folds the strip, callback scripts, and passthrough flags
 // into one filter-repo pass so exactly one original→final commit-map results.
 type CombinedOpts struct {
-	// StripActive is the --strip-large-files intent; drives path-selection
-	// validation even when no paths are flagged. Never derived from PathsFromFile.
-	StripActive bool
+	// StripMode is the --strip-large-files intent; drives passthrough-flag
+	// validation even when nothing is flagged. Never derived from
+	// PathsFromFile or StripBlobsBiggerThan.
+	StripMode StripMode
 	// PathsFromFile adds --invert-paths --paths-from-file; set only when a
-	// strip was requested AND at least one path was flagged.
+	// path-mode strip was requested AND at least one path was flagged.
 	PathsFromFile string
+	// StripBlobsBiggerThan is in bytes; >0 adds --strip-blobs-bigger-than
+	// <bytes>. Set only when size mode found oversized blobs.
+	StripBlobsBiggerThan int64
 	// ScriptPaths are callback scripts dispatched by filename suffix;
 	// bodies are attached as flag/body pairs and never logged.
 	ScriptPaths []string
@@ -459,7 +511,7 @@ type CombinedOpts struct {
 // passthrough flags, yielding a single original→final commit-map. Validation
 // matches the helpers it replaces; script bodies are never logged.
 func (r *Runner) Run(ctx context.Context, bareRepoPath string, opts CombinedOpts) error {
-	if err := ValidateUserFlags(opts.PassthroughFlags, opts.StripActive); err != nil {
+	if err := ValidateUserFlags(opts.PassthroughFlags, opts.StripMode); err != nil {
 		return err
 	}
 	if len(opts.PreRewriteScripts) > 0 {
@@ -472,6 +524,12 @@ func (r *Runner) Run(ctx context.Context, bareRepoPath string, opts CombinedOpts
 	if opts.PathsFromFile != "" {
 		args = append(args, "--invert-paths", "--paths-from-file", opts.PathsFromFile)
 		r.info(fmt.Sprintf("stripping paths listed in %s", opts.PathsFromFile))
+	}
+	if opts.StripBlobsBiggerThan > 0 {
+		// Always raw bytes: filter-repo only accepts integers with an
+		// optional K/M/G suffix, so a fractional size would crash it.
+		args = append(args, "--strip-blobs-bigger-than", strconv.FormatInt(opts.StripBlobsBiggerThan, 10))
+		r.info(fmt.Sprintf("stripping blobs larger than %s (%d bytes)", output.HumanBytes(opts.StripBlobsBiggerThan), opts.StripBlobsBiggerThan))
 	}
 
 	// Seed seen-kinds from passthrough callback flags so a kind supplied

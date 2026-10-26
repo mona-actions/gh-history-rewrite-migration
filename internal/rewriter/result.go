@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/mona-actions/gh-history-rewrite-migration/internal/filterrepo"
 	"github.com/mona-actions/gh-history-rewrite-migration/internal/output"
 )
 
@@ -30,6 +31,20 @@ func (r *Result) Render(printer TablePrinter, warn WarnFn) {
 		warn = func(msg string) { output.Warn(msg) }
 	}
 
+	if r.AnalyzeOnly {
+		printer(
+			[]string{"metric", "value"},
+			[][]string{
+				{"mode", "analysis only (no changes)"},
+				{"paths over threshold", fmt.Sprintf("%d", r.AnalyzedPaths)},
+			},
+		)
+		for _, w := range r.Warnings {
+			warn(w)
+		}
+		return
+	}
+
 	scripts := strings.Join(r.ScriptsRun, ", ")
 	if scripts == "" {
 		scripts = "(none)"
@@ -42,27 +57,42 @@ func (r *Result) Render(printer TablePrinter, warn WarnFn) {
 	if flags == "" {
 		flags = "(none)"
 	}
+	mode := r.StripMode.String()
+	if r.StripMode == filterrepo.StripNone {
+		mode = "(none)"
+	}
+	sizeMode := r.StripMode == filterrepo.StripBySize
+	bytesLabel := "bytes freed"
+	if sizeMode {
+		// The scan counts unreachable blobs too, so these are upper bounds.
+		bytesLabel = "bytes freed (up to, uncompressed)"
+	}
 
-	printer(
-		[]string{"metric", "value"},
-		[][]string{
-			{"strip performed", boolStr(r.StripPerformed)},
-			{"paths stripped", fmt.Sprintf("%d", len(r.PathsStripped))},
-			{"largest stripped", output.HumanBytes(r.LargestStripped)},
-			{"bytes freed", output.HumanBytes(r.BytesFreed)},
-			{"pre-rewrite scripts", fmt.Sprintf("%d (%s)", len(r.PreScriptsRun), preScripts)},
-			{"scripts run", fmt.Sprintf("%d (%s)", len(r.ScriptsRun), scripts)},
-			{"flags applied", flags},
-			{"commits remapped", fmt.Sprintf("%d", r.CommitsRemapped)},
-		},
+	rows := [][]string{
+		{"strip performed", boolStr(r.StripPerformed)},
+		{"strip mode", mode},
+	}
+	if sizeMode {
+		rows = append(rows, []string{"blobs stripped (up to)", fmt.Sprintf("%d", r.BlobsStripped)})
+	} else {
+		rows = append(rows, []string{"paths stripped", fmt.Sprintf("%d", len(r.PathsStripped))})
+	}
+	rows = append(rows,
+		[]string{"largest stripped", output.HumanBytes(r.LargestStripped)},
+		[]string{bytesLabel, output.HumanBytes(r.BytesFreed)},
+		[]string{"pre-rewrite scripts", fmt.Sprintf("%d (%s)", len(r.PreScriptsRun), preScripts)},
+		[]string{"scripts run", fmt.Sprintf("%d (%s)", len(r.ScriptsRun), scripts)},
+		[]string{"flags applied", flags},
+		[]string{"commits remapped", fmt.Sprintf("%d", r.CommitsRemapped)},
 	)
+	printer([]string{"metric", "value"}, rows)
 
-	if len(r.PathsStripped) > 0 {
-		rows := make([][]string, 0, len(r.PathsStripped))
+	if !sizeMode && len(r.PathsStripped) > 0 {
+		pathRows := make([][]string, 0, len(r.PathsStripped))
 		for _, p := range r.PathsStripped {
-			rows = append(rows, []string{p})
+			pathRows = append(pathRows, []string{p})
 		}
-		printer([]string{"stripped path"}, rows)
+		printer([]string{"stripped path"}, pathRows)
 	}
 
 	for _, w := range r.Warnings {

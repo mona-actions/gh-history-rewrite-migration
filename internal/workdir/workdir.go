@@ -106,6 +106,19 @@ func (w *WorkDir) CleanupTxt() string {
 	return filepath.Join(w.root, "cleanup.txt")
 }
 
+// LargeBlobsTxt returns the absolute path to the list of oversized blobs
+// ("sha\tsize" per line) written by the size-mode large-file scan.
+func (w *WorkDir) LargeBlobsTxt() string {
+	return filepath.Join(w.root, "large-blobs.txt")
+}
+
+// AnalysisDir returns the absolute path to the git filter-repo --analyze
+// report directory. It lives outside the extracted bare repo so the report
+// is never re-archived into the migrated git archive.
+func (w *WorkDir) AnalysisDir() string {
+	return filepath.Join(w.root, "analysis")
+}
+
 // HasCommitMap checks if the commit map file exists.
 func (w *WorkDir) HasCommitMap() bool {
 	_, err := os.Stat(w.CommitMap())

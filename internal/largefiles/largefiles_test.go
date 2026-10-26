@@ -2,6 +2,8 @@ package largefiles
 
 import (
 	"context"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -143,6 +145,90 @@ func TestWriteCleanupFile_NilReport(t *testing.T) {
 
 func TestAnalyze_RejectsNonPositiveThreshold(t *testing.T) {
 	a := &Analyzer{threshold: 0}
-	_, err := a.Analyze(context.TODO(), "/tmp")
+	_, err := a.Analyze(context.TODO(), "/tmp", "/tmp/analysis")
 	require.Error(t, err)
+}
+
+// catFileExecer is a filterrepo.Execer stub that emits fixed
+// `git cat-file --batch-check` output.
+type catFileExecer struct {
+	stdout string
+	err    error
+	args   []string
+}
+
+func (c *catFileExecer) LookPath(name string) (string, error) { return "/usr/bin/" + name, nil }
+
+func (c *catFileExecer) Run(_ context.Context, _, _ string, args []string, stdout, _ io.Writer) error {
+	c.args = args
+	if _, err := io.WriteString(stdout, c.stdout); err != nil {
+		return err
+	}
+	return c.err
+}
+
+func TestScanBlobs_BuildsReport(t *testing.T) {
+	exec := &catFileExecer{stdout: "commit 9999 c0\n" +
+		"blob 100 aaaa\n" +
+		"blob 300 bbbb\n" +
+		"blob 101 cccc\n" +
+		"tree 9999 t0\n" +
+		"blob 50 dddd\n"}
+	a := New(filterrepo.New(exec, nil), nil, 100)
+
+	rep, err := a.ScanBlobs(context.Background(), "/repo.git")
+	require.NoError(t, err)
+	assert.Contains(t, exec.args, "cat-file")
+	assert.EqualValues(t, 100, rep.Threshold)
+	assert.Equal(t, 4, rep.TotalBlobs)
+	assert.Equal(t, []Blob{{SHA: "bbbb", Size: 300}, {SHA: "cccc", Size: 101}}, rep.Blobs)
+	assert.EqualValues(t, 300, rep.Largest)
+	assert.EqualValues(t, 401, rep.Total)
+}
+
+func TestScanBlobs_NoneOversized(t *testing.T) {
+	a := New(filterrepo.New(&catFileExecer{stdout: "blob 10 aaaa\n"}, nil), nil, 100)
+	rep, err := a.ScanBlobs(context.Background(), "/repo.git")
+	require.NoError(t, err)
+	assert.Equal(t, 1, rep.TotalBlobs)
+	assert.Empty(t, rep.Blobs)
+	assert.Zero(t, rep.Largest)
+	assert.Zero(t, rep.Total)
+}
+
+func TestScanBlobs_PropagatesError(t *testing.T) {
+	a := New(filterrepo.New(&catFileExecer{err: errors.New("boom")}, nil), nil, 100)
+	rep, err := a.ScanBlobs(context.Background(), "/repo.git")
+	require.Error(t, err)
+	assert.Nil(t, rep)
+	assert.Contains(t, err.Error(), "boom")
+}
+
+func TestScanBlobs_RejectsBadConfig(t *testing.T) {
+	_, err := (&Analyzer{threshold: 0}).ScanBlobs(context.Background(), "/repo.git")
+	require.Error(t, err)
+	_, err = (&Analyzer{threshold: 100}).ScanBlobs(context.Background(), "/repo.git")
+	require.Error(t, err, "nil runner")
+}
+
+func TestWriteBlobList_RoundTrip(t *testing.T) {
+	dest := filepath.Join(t.TempDir(), "large-blobs.txt")
+	rep := &BlobReport{Blobs: []Blob{{SHA: "bbbb", Size: 300}, {SHA: "cccc", Size: 101}}}
+	require.NoError(t, rep.WriteBlobList(dest))
+	data, err := os.ReadFile(dest)
+	require.NoError(t, err)
+	assert.Equal(t, "bbbb\t300\ncccc\t101\n", string(data))
+}
+
+func TestWriteBlobList_EmptyReport(t *testing.T) {
+	dest := filepath.Join(t.TempDir(), "large-blobs.txt")
+	require.NoError(t, (&BlobReport{}).WriteBlobList(dest))
+	info, err := os.Stat(dest)
+	require.NoError(t, err)
+	assert.Zero(t, info.Size())
+}
+
+func TestWriteBlobList_Errors(t *testing.T) {
+	require.Error(t, (*BlobReport)(nil).WriteBlobList(filepath.Join(t.TempDir(), "x")))
+	require.Error(t, (&BlobReport{}).WriteBlobList(""))
 }

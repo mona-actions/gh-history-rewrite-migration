@@ -297,6 +297,40 @@ func TestRun_NoCommitMap_CopiesRawMetadataAndSkipsRemap(t *testing.T) {
 	}
 }
 
+func TestRun_AnalyzeOnly_SkipsRemapAndImport(t *testing.T) {
+	e := &fakeExporter{}
+	rw := &fakeRewriter{res: &rewriter.Result{AnalyzeOnly: true, AnalyzedPaths: 3}}
+	rm := &fakeRemapper{}
+	im := &fakeImporter{}
+
+	o, rec := build(t, nil, e, rw, rm, im, Config{TargetRepoURL: "https://github.com/x/y"})
+	if err := o.Run(context.Background()); err != nil {
+		t.Fatalf("expected nil error for analyze-only run, got %v", err)
+	}
+	if !e.called || !rw.called {
+		t.Errorf("export and rewrite must run before an analyze-only stop")
+	}
+	if rm.called {
+		t.Error("remapper must not run after an analyze-only rewrite")
+	}
+	if im.called {
+		t.Error("importer must not run after an analyze-only rewrite")
+	}
+	if _, err := os.Stat(o.wd.MetadataArchive()); !os.IsNotExist(err) {
+		t.Errorf("metadata archive must not be produced in analyze-only mode (stat err=%v)", err)
+	}
+	out := rec.joined()
+	if !strings.Contains(out, "TABLE") {
+		t.Errorf("expected analysis report table to be rendered; got: %s", out)
+	}
+	if !strings.Contains(out, "INFO:Analysis only; no changes made.") {
+		t.Errorf("expected analysis-only info message; got: %s", out)
+	}
+	if strings.Contains(out, "Migration complete") {
+		t.Errorf("must not print migration-complete banner; got: %s", out)
+	}
+}
+
 func TestNew_NilPrintersAreNoOp(t *testing.T) {
 	// Construct with empty Printers and ensure Run doesn't panic.
 	o := New(nil, nil,

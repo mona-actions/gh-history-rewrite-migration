@@ -36,7 +36,9 @@ type ExporterRunner interface {
 
 // RewriterRunner is the minimal rewrite-phase surface used by the
 // orchestrator. *rewriter.Rewriter satisfies this directly. A nil
-// Result with a nil error indicates an idempotent skip.
+// Result with a nil error indicates an idempotent skip. A Result with
+// AnalyzeOnly=true means no final git archive or commit-map was written,
+// so callers must not remap or import.
 type RewriterRunner interface {
 	Run(ctx context.Context, inputs ...rewriter.Input) (*rewriter.Result, error)
 }
@@ -195,6 +197,12 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		// happened before any later phase fails. Result.Render
 		// also surfaces res.Warnings via the Warn printer.
 		res.Render(o.out.Table, o.out.Warn)
+		// A report-only --analyze run rewrote nothing, so there is
+		// nothing to remap or import yet.
+		if res.AnalyzeOnly {
+			o.out.Info("Analysis only; no changes made. Re-run with --resume --strip-large-files (add --analyze to strip the flagged paths) to rewrite and import.")
+			return nil
+		}
 	} else {
 		o.out.Info("Rewrite skipped (already complete in this work-dir).")
 	}
