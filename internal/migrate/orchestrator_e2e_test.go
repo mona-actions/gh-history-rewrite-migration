@@ -69,7 +69,7 @@ func TestOrchestratorE2E_TwoMode_RealFixture(t *testing.T) {
 	assert.FileExists(t, res.wd.GitArchive())
 	assert.FileExists(t, res.wd.MetadataArchive())
 	assert.FileExists(t, filepath.Join(res.wd.GitExtractedDir(), ".complete"))
-	assert.FileExists(t, filepath.Join(res.wd.MetadataExtractedDir(), ".complete"))
+	assert.NoDirExists(t, res.wd.MetadataExtractedDir(), "fresh raw metadata should stream without extraction")
 	// StripLargeFiles without Analyze is size mode: a blob scan, no --analyze.
 	assert.Equal(t, "size", tableValue(res.output.tables, "strip mode"))
 	assert.FileExists(t, res.wd.LargeBlobsTxt(), "a 1-byte threshold should flag blobs in the real fixture")

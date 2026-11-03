@@ -3,10 +3,14 @@
 package remap
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -78,10 +82,19 @@ func (r *RealRemapper) Run(ctx context.Context, in Input) (Result, error) {
 
 	if len(commitMap) == 0 {
 		if err := atomicfs.WriteFileAtomicPath(finalArchive, func(partial string) error {
-			if atomicfs.IsDirComplete(in.MetadataExtractedDir) {
-				return archive.ReTarDir(in.MetadataExtractedDir, partial)
+			if err := ctx.Err(); err != nil {
+				return err
 			}
-			return atomicfs.CopyFile(in.RawMetadataArchive, partial)
+			var err error
+			if atomicfs.IsDirComplete(in.MetadataExtractedDir) {
+				err = archive.ReTarDir(in.MetadataExtractedDir, partial)
+			} else {
+				err = atomicfs.CopyFile(in.RawMetadataArchive, partial)
+			}
+			if err != nil {
+				return err
+			}
+			return ctx.Err()
 		}); err != nil {
 			return Result{}, err
 		}
@@ -100,41 +113,65 @@ func (r *RealRemapper) Run(ctx context.Context, in Input) (Result, error) {
 	if err := ctx.Err(); err != nil {
 		return Result{}, err
 	}
-	if !atomicfs.IsDirComplete(in.MetadataExtractedDir) {
-		if err := os.RemoveAll(in.MetadataExtractedDir); err != nil {
-			return Result{}, fmt.Errorf("reset metadata extraction dir: %w", err)
-		}
-		if _, err := archive.UnTar(in.RawMetadataArchive, in.MetadataExtractedDir); err != nil {
-			return Result{}, fmt.Errorf("untar metadata: %w", err)
-		}
-		if err := atomicfs.MarkDirComplete(in.MetadataExtractedDir); err != nil {
+	var stats commitremap.Stats
+	var metaDir string
+	var unknown []string
+	if atomicfs.IsDirComplete(in.MetadataExtractedDir) {
+		extractRoot, err := workdir.DescendIntoSingleSubdir(in.MetadataExtractedDir)
+		if err != nil {
 			return Result{}, err
 		}
-	}
-
-	extractRoot, err := workdir.DescendIntoSingleSubdir(in.MetadataExtractedDir)
-	if err != nil {
-		return Result{}, err
-	}
-
-	metadataDirs, err := workdir.FindMetadataDirs(extractRoot, SHABearingPrefixes)
-	if err != nil {
-		return Result{}, err
-	}
-	if len(metadataDirs) == 0 {
-		return Result{}, fmt.Errorf("no metadata files matching SHA-bearing prefixes found under %s; archive may be empty or format changed", extractRoot)
-	}
-	if len(metadataDirs) > 1 {
-		return Result{}, fmt.Errorf("multiple metadata directories found under %s; multi-repo migrations are not supported: %s", extractRoot, strings.Join(metadataDirs, ", "))
-	}
-	metaDir := metadataDirs[0]
-
-	if err := ctx.Err(); err != nil {
-		return Result{}, err
-	}
-	stats, err := commitremap.ProcessFiles(metaDir, SHABearingPrefixes, commitMap)
-	if err != nil {
-		return Result{}, fmt.Errorf("process files: %w", err)
+		metadataDirs, err := workdir.FindMetadataDirs(extractRoot, SHABearingPrefixes)
+		if err != nil {
+			return Result{}, err
+		}
+		if len(metadataDirs) == 0 {
+			return Result{}, fmt.Errorf("no metadata files matching SHA-bearing prefixes found under %s; archive may be empty or format changed", extractRoot)
+		}
+		if len(metadataDirs) > 1 {
+			return Result{}, fmt.Errorf("multiple metadata directories found under %s; multi-repo migrations are not supported: %s", extractRoot, strings.Join(metadataDirs, ", "))
+		}
+		metaDir = metadataDirs[0]
+		if err := ctx.Err(); err != nil {
+			return Result{}, err
+		}
+		stats, err = commitremap.ProcessFiles(metaDir, SHABearingPrefixes, commitMap, commitremap.ProcessOptions{})
+		if err != nil {
+			return Result{}, fmt.Errorf("process files: %w", err)
+		}
+		unknown = findUnknownPrefixes(metaDir)
+		if err := atomicfs.WriteFileAtomicPath(finalArchive, func(partial string) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if err := archive.ReTarDir(in.MetadataExtractedDir, partial); err != nil {
+				return err
+			}
+			return ctx.Err()
+		}); err != nil {
+			return Result{}, err
+		}
+	} else {
+		if err := atomicfs.WriteFileAtomicPath(finalArchive, func(partial string) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			var err error
+			stats, err = archive.StreamRemap(in.RawMetadataArchive, partial, commitMap, SHABearingPrefixes)
+			if err != nil {
+				return fmt.Errorf("stream remap: %w", err)
+			}
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			metaDir, unknown, err = inspectMetadataLayout(ctx, in.RawMetadataArchive)
+			if err != nil {
+				return fmt.Errorf("inspect metadata layout: %w", err)
+			}
+			return ctx.Err()
+		}); err != nil {
+			return Result{}, err
+		}
 	}
 
 	var warnings []string
@@ -142,16 +179,10 @@ func (r *RealRemapper) Run(ctx context.Context, in Input) (Result, error) {
 		warnings = append(warnings, fmt.Sprintf("commit-map has %d entries but 0 files were rewritten — possible archive format mismatch in %s", len(commitMap), metaDir))
 	}
 
-	for _, p := range findUnknownPrefixes(metaDir) {
+	for _, p := range unknown {
 		warnings = append(warnings, fmt.Sprintf("unrecognized prefix file %q under %s — SHAs in this file (if any) were NOT rewritten; please file a bug", p, metaDir))
 	}
 	r.emitWarnings(warnings)
-
-	if err := atomicfs.WriteFileAtomicPath(finalArchive, func(partial string) error {
-		return archive.ReTarDir(in.MetadataExtractedDir, partial)
-	}); err != nil {
-		return Result{}, err
-	}
 
 	return Result{
 		GitArchivePath:      in.WorkDir.GitArchive(),
@@ -160,6 +191,72 @@ func (r *RealRemapper) Run(ctx context.Context, in Input) (Result, error) {
 		FilesScanned:        stats.FilesScanned,
 		Warnings:            warnings,
 	}, nil
+}
+
+// Inspect after upstream safety validation, before publishing the partial archive.
+// Stats expose changed files only; layout checks need every matched name.
+func inspectMetadataLayout(ctx context.Context, file string) (string, []string, error) {
+	f, err := os.Open(file)
+	if err != nil {
+		return "", nil, err
+	}
+	defer func() { _ = f.Close() }()
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		return "", nil, err
+	}
+	defer func() { _ = gz.Close() }()
+	prefixes := map[string]bool{}
+	for _, prefix := range SHABearingPrefixes {
+		prefixes[prefix] = true
+	}
+	roots := map[string]bool{}
+	names := map[string][]string{}
+	tr := tar.NewReader(gz)
+	for {
+		if err := ctx.Err(); err != nil {
+			return "", nil, err
+		}
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", nil, err
+		}
+		if hdr.Typeflag == tar.TypeReg {
+			name := path.Clean(hdr.Name)
+			dir := path.Dir(name)
+			if commitremap.ShouldRemap(name, prefixes) {
+				roots[dir] = true
+			}
+			if strings.HasSuffix(name, ".json") && strings.Contains(path.Base(name), "_") {
+				names[dir] = append(names[dir], path.Base(name))
+			}
+		}
+		if _, err := io.Copy(io.Discard, tr); err != nil {
+			return "", nil, err
+		}
+	}
+	// Tar EOF precedes the gzip trailer; drain it to verify checksum and size.
+	if _, err := io.Copy(io.Discard, gz); err != nil {
+		return "", nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return "", nil, err
+	}
+	var dirs []string
+	for dir := range roots {
+		dirs = append(dirs, dir)
+	}
+	sort.Strings(dirs)
+	if len(dirs) == 0 {
+		return "", nil, fmt.Errorf("no metadata files matching SHA-bearing prefixes found under %s; archive may be empty or format changed", file)
+	}
+	if len(dirs) > 1 {
+		return "", nil, fmt.Errorf("multiple metadata directories found under %s; multi-repo migrations are not supported: %s", file, strings.Join(dirs, ", "))
+	}
+	return file + " (" + dirs[0] + ")", unknownPrefixes(names[dirs[0]]), nil
 }
 
 func (r *RealRemapper) emitWarnings(warnings []string) {
@@ -201,6 +298,10 @@ func Validate(in Input) error {
 // of any remainders.
 func findUnknownPrefixes(metaDir string) []string {
 	matches, _ := filepath.Glob(filepath.Join(metaDir, "*_*.json"))
+	return unknownPrefixes(matches)
+}
+
+func unknownPrefixes(matches []string) []string {
 	known := map[string]bool{}
 	for _, p := range SHABearingPrefixes {
 		known[p] = true
