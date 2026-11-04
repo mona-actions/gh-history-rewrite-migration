@@ -139,6 +139,9 @@ func (r *RealRemapper) Run(ctx context.Context, in Input) (Result, error) {
 		if err != nil {
 			return Result{}, fmt.Errorf("process files: %w", err)
 		}
+		if stats.FilesScanned == 0 {
+			return Result{}, fmt.Errorf("no metadata files matching SHA-bearing prefixes found under %s; archive may be empty or format changed", metaDir)
+		}
 		unknown = findUnknownPrefixes(metaDir)
 		if err := atomicfs.WriteFileAtomicPath(finalArchive, func(partial string) error {
 			if err := ctx.Err(); err != nil {

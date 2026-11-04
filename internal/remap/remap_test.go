@@ -240,6 +240,17 @@ func TestLayoutErrorWhenNoSHABearingFilesMatched(t *testing.T) {
 	}
 }
 
+func TestCompletedMetadataRejectsFilesThatUpstreamCannotRemap(t *testing.T) {
+	fx := newFixture(t, map[string]string{"issues_backup.json": `[{"sha":"` + oldSHA1 + `"}]`}, commitMap(oldSHA1+" "+newSHA1))
+	completeMetadataFixture(t, fx)
+
+	_, err := NewReal(nil).Run(context.Background(), fx.in)
+	if err == nil || !strings.Contains(err.Error(), "no metadata files matching SHA-bearing prefixes") {
+		t.Fatalf("expected no-remappable-files error, got %v", err)
+	}
+	assertNoRemapPublication(t, fx)
+}
+
 func TestRawUnknownPrefixWarningScope(t *testing.T) {
 	fx := newFixture(t, map[string]string{
 		"./wrapper/issues_1.json":                   oldSHA1,
