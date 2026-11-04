@@ -5,7 +5,7 @@ go 1.25.5
 require (
 	github.com/gofri/go-github-ratelimit v1.1.1
 	github.com/google/go-github/v86 v86.0.0
-	github.com/mona-actions/gh-commit-remap v0.1.0
+	github.com/mona-actions/gh-commit-remap v0.2.1
 	github.com/pterm/pterm v0.12.83
 	github.com/shurcooL/githubv4 v0.0.0-20260209031235-2402fdf4a9ed
 	github.com/spf13/cobra v1.9.1
@@ -28,6 +28,8 @@ require (
 	github.com/gookit/color v1.6.0 // indirect
 	github.com/hashicorp/hcl v1.0.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
+	github.com/klauspost/compress v1.18.6 // indirect
+	github.com/klauspost/pgzip v1.2.6 // indirect
 	github.com/lithammer/fuzzysearch v1.1.8 // indirect
 	github.com/magiconair/properties v1.8.7 // indirect
 	github.com/mattn/go-runewidth v0.0.23 // indirect

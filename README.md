@@ -145,7 +145,7 @@ A completed v2 work directory contains:
 ├── git_archive_raw.tar.gz       # raw git-only export
 ├── metadata_archive_raw.tar.gz  # raw metadata-only export
 ├── git_extracted/               # extracted git archive; contains repositories/<org>/<repo>.git/
-├── metadata_extracted/          # extracted metadata archive; contains metadata JSONs
+├── metadata_extracted/          # optional: combined export or completed legacy extraction
 ├── git_archive.tar.gz           # final rewritten git archive for gh gei import
 ├── metadata_archive.tar.gz      # final remapped metadata archive for gh gei import
 ├── commit-map                   # git filter-repo old-sha -> new-sha map
@@ -188,8 +188,6 @@ Run `gh history-rewrite-migration <command> --help` for the full flag surface.
 - **Single-repo only.** Multi-repo migration archives are rejected, but a companion wiki repo (`<name>.wiki.git`) next to the main repo is allowed. Run the orchestrator once per main repository.
 - **Wiki history is migrated as-is.** Rewrites, large-file stripping, LFS checks, and commit-SHA remapping apply only to the main repo. Secrets or large files in wiki history are migrated unchanged, and commit SHAs referenced in wiki pages are not remapped.
 - **Target is always GHEC (`github.com`).** `gh gei migrate-repo` does not support GHES targets, so this orchestrator does not expose a `--target-hostname` flag. Sources may be GHEC or GHES (set `--source-hostname` for GHES).
-- **Upstream `gh-commit-remap` prefix list is incomplete.** Upstream's known SHA-bearing metadata prefixes do not currently include every file where commit SHAs may appear. This project extends the list in `internal/remap` via `SHABearingPrefixes`.
-- **Upstream `gh-commit-remap` scans top-level metadata files only.** This project works around that by recursively discovering metadata roots with `FindMetadataDirs` before invoking the remapper.
 - **`filter-repo` strips GPG signatures silently.** This is upstream behavior; signed-commit compliance teams should be aware. The post-rewrite summary surfaces whether signed commits were detected.
 - **LFS pointer mappings are not rewritten.** LFS objects live outside the bare repo, so `filter-repo` cannot touch them. When `--strip-large-files` would touch an LFS-enabled archive, `--allow-lfs-rewrite` is required and the orchestrator surfaces a prominent warning.
 - **Pushed forks downstream of rewritten history will diverge.** History rewriting changes every commit SHA from the strip point forward; consumers of the source repo must re-clone.

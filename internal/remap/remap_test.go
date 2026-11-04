@@ -159,7 +159,15 @@ func TestValidate_MissingCommitMap(t *testing.T) {
 }
 
 func TestEmptyCommitMapNoOpCopiesRawArchive(t *testing.T) {
-	fx := newFixture(t, map[string]string{"users_000001.json": `[{"login":"octo"}]`}, "")
+	for _, mapping := range []string{"", "old new\n"} {
+		t.Run(mapping, func(t *testing.T) {
+			testEmptyCommitMapCopiesRawArchive(t, mapping)
+		})
+	}
+}
+
+func testEmptyCommitMapCopiesRawArchive(t *testing.T, mapping string) {
+	fx := newFixture(t, map[string]string{"users_000001.json": `[{"login":"octo"}]`}, mapping)
 	res := runRemap(t, fx)
 
 	if res.CommitsRemapped != 0 {
@@ -185,7 +193,18 @@ func TestHappyPathRewritesSHAs(t *testing.T) {
 	fx := newFixture(t, map[string]string{
 		"issues_000001.json": `[{"sha":"` + oldSHA1 + `","nested":{"other":"` + oldSHA2 + `"}}]`,
 	}, commitMap(oldSHA1+" "+newSHA1, oldSHA2+" "+newSHA2))
+	raw, err := os.ReadFile(fx.in.RawMetadataArchive)
+	if err != nil {
+		t.Fatal(err)
+	}
 	res := runRemap(t, fx)
+	after, err := os.ReadFile(fx.in.RawMetadataArchive)
+	if err != nil || !bytes.Equal(raw, after) {
+		t.Fatalf("raw archive changed: %v", err)
+	}
+	if _, err := os.Stat(fx.in.MetadataExtractedDir); !os.IsNotExist(err) {
+		t.Fatalf("streaming created extraction directory: %v", err)
+	}
 
 	if res.CommitsRemapped != 2 || res.FilesScanned != 1 {
 		t.Fatalf("unexpected result: %+v", res)
@@ -208,10 +227,51 @@ func TestLayoutWarningWhenNoFilesChanged(t *testing.T) {
 }
 
 func TestLayoutErrorWhenNoSHABearingFilesMatched(t *testing.T) {
-	fx := newFixture(t, map[string]string{"users_000001.json": `[{"login":"octo"}]`}, commitMap(oldSHA1+" "+newSHA1))
+	for _, completed := range []bool{false, true} {
+		fx := newFixture(t, map[string]string{"users_000001.json": `[{"login":"octo"}]`}, commitMap(oldSHA1+" "+newSHA1))
+		if completed {
+			completeMetadataFixture(t, fx)
+		}
+		_, err := NewReal(nil).Run(context.Background(), fx.in)
+		if err == nil || !strings.Contains(err.Error(), "no metadata files matching SHA-bearing prefixes") {
+			t.Fatalf("expected no-matched-files layout error, got %v", err)
+		}
+		assertNoRemapPublication(t, fx)
+	}
+}
+
+func TestCompletedMetadataRejectsFilesThatUpstreamCannotRemap(t *testing.T) {
+	fx := newFixture(t, map[string]string{"issues_backup.json": `[{"sha":"` + oldSHA1 + `"}]`}, commitMap(oldSHA1+" "+newSHA1))
+	completeMetadataFixture(t, fx)
+
 	_, err := NewReal(nil).Run(context.Background(), fx.in)
 	if err == nil || !strings.Contains(err.Error(), "no metadata files matching SHA-bearing prefixes") {
-		t.Fatalf("expected no-matched-files layout error, got %v", err)
+		t.Fatalf("expected no-remappable-files error, got %v", err)
+	}
+	assertNoRemapPublication(t, fx)
+}
+
+func TestRawUnknownPrefixWarningScope(t *testing.T) {
+	fx := newFixture(t, map[string]string{
+		"./wrapper/issues_1.json":                   oldSHA1,
+		"wrapper/future_reviews_1.json":             oldSHA1,
+		"wrapper/future_reviews_2.json":             oldSHA1,
+		"wrapper/attachments/nested_reviews_1.json": oldSHA1,
+		"sibling/sibling_reviews_1.json":            oldSHA1,
+	}, commitMap(oldSHA1+" "+newSHA1))
+	logger := &recordingLogger{}
+	res, err := NewReal(logger).Run(context.Background(), fx.in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Warnings) != 1 || !strings.Contains(res.Warnings[0], `"future_reviews"`) {
+		t.Fatalf("expected only selected-root warning, got %v", res.Warnings)
+	}
+	if !hasWarningContaining(logger.warns, res.Warnings[0]) {
+		t.Fatalf("warning not logged: %v", logger.warns)
+	}
+	if got := readExtracted(t, extractFinal(t, fx), "wrapper/future_reviews_1.json"); got != oldSHA1 {
+		t.Fatalf("unknown metadata changed: %q", got)
 	}
 }
 
@@ -230,6 +290,7 @@ func TestUnknownPrefixWarning(t *testing.T) {
 		"issues_000001.json":              `[{"sha":"` + oldSHA1 + `"}]`,
 		"discussion_comments_000001.json": `[{"sha":"` + oldSHA1 + `"}]`,
 	}, commitMap(oldSHA1+" "+newSHA1))
+	completeMetadataFixture(t, fx)
 	res := runRemap(t, fx)
 	if !hasWarningContaining(res.Warnings, `unrecognized prefix file "discussion_comments"`) || !hasWarningContaining(res.Warnings, "unrecognized prefix") {
 		t.Fatalf("expected unknown-prefix warning, got %#v", res.Warnings)
@@ -263,13 +324,71 @@ func TestFindUnknownPrefixes(t *testing.T) {
 }
 
 func TestMultiRepoGuard(t *testing.T) {
-	fx := newFixture(t, map[string]string{
-		"repo-one/issues_000001.json": `[{"sha":"` + oldSHA1 + `"}]`,
-		"repo-two/issues_000001.json": `[{"sha":"` + oldSHA1 + `"}]`,
-	}, commitMap(oldSHA1+" "+newSHA1))
-	_, err := NewReal(nil).Run(context.Background(), fx.in)
-	if err == nil || !strings.Contains(err.Error(), "multiple metadata directories") || !strings.Contains(err.Error(), "repo-one") || !strings.Contains(err.Error(), "repo-two") {
-		t.Fatalf("expected multi-repo error naming discovered dirs, got %v", err)
+	for _, contents := range [][2]string{{oldSHA1, oldSHA1}, {oldSHA1, oldSHA2}, {oldSHA2, oldSHA2}} {
+		fx := newFixture(t, map[string]string{
+			"repo-one/issues_000001.json": contents[0],
+			"repo-two/issues_000001.json": contents[1],
+		}, commitMap(oldSHA1+" "+newSHA1))
+		_, err := NewReal(nil).Run(context.Background(), fx.in)
+		if err == nil || !strings.Contains(err.Error(), "multiple metadata directories") || !strings.Contains(err.Error(), "repo-one") || !strings.Contains(err.Error(), "repo-two") {
+			t.Fatalf("expected multi-repo error naming discovered dirs, got %v", err)
+		}
+		assertNoRemapPublication(t, fx)
+	}
+}
+
+func assertNoRemapPublication(t *testing.T, fx remapFixture) {
+	t.Helper()
+	if _, err := os.Stat(fx.wd.MetadataArchive()); !os.IsNotExist(err) {
+		t.Fatalf("failed remap published an archive: %v", err)
+	}
+	partials, err := filepath.Glob(fx.wd.MetadataArchive() + "*.partial")
+	if err != nil || len(partials) != 0 {
+		t.Fatalf("partial output left behind: %v, %v", partials, err)
+	}
+}
+
+func TestRawArchiveIntegrityErrors(t *testing.T) {
+	for _, truncate := range []bool{false, true} {
+		fx := newFixture(t, map[string]string{"issues_1.json": oldSHA1}, commitMap(oldSHA1+" "+newSHA1))
+		raw, err := os.ReadFile(fx.in.RawMetadataArchive)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if truncate {
+			raw = raw[:len(raw)/2]
+		} else {
+			raw[len(raw)-8] ^= 0xff
+		}
+		if err := os.WriteFile(fx.in.RawMetadataArchive, raw, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := NewReal(nil).Run(context.Background(), fx.in); err == nil {
+			t.Fatal("accepted corrupt archive")
+		}
+		assertNoRemapPublication(t, fx)
+	}
+}
+
+func completeMetadataFixture(t *testing.T, fx remapFixture) {
+	t.Helper()
+	if _, err := archive.UnTar(fx.in.RawMetadataArchive, fx.in.MetadataExtractedDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := atomicfs.MarkDirComplete(fx.in.MetadataExtractedDir); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCompletedMetadataTakesPrecedence(t *testing.T) {
+	fx := newFixture(t, map[string]string{"issues_1.json": oldSHA1}, commitMap(oldSHA1+" "+newSHA1))
+	completeMetadataFixture(t, fx)
+	if err := os.WriteFile(filepath.Join(fx.in.MetadataExtractedDir, "issues_1.json"), []byte(oldSHA2), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runRemap(t, fx)
+	if got := readExtracted(t, extractFinal(t, fx), "issues_1.json"); got != oldSHA2 {
+		t.Fatalf("raw archive took precedence over completed directory: %q", got)
 	}
 }
 
@@ -360,6 +479,7 @@ func TestWarningsAreLogged(t *testing.T) {
 		"issues_000001.json":              `[{"sha":"3333333333333333333333333333333333333333"}]`,
 		"discussion_comments_000001.json": `[{"sha":"` + oldSHA1 + `"}]`,
 	}, commitMap(oldSHA1+" "+newSHA1))
+	completeMetadataFixture(t, fx)
 	logger := &recordingLogger{}
 	res, err := NewReal(logger).Run(context.Background(), fx.in)
 	if err != nil {
